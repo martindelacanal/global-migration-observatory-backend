@@ -7,8 +7,6 @@ const axios = require('axios');
 const logger = require('../utils/logger.js');
 const createCsvStringifier = require('csv-writer').createObjectCsvStringifier;
 const JSZip = require('jszip');
-const { sendTicketEmail } = require('../email/email');
-const { sendVolunteerConfirmation } = require('../email/email');
 const multer = require('multer');
 const storage = multer.memoryStorage();
 
@@ -54,9 +52,7 @@ const jwtSignAsync = (data, secret, options) => {
   });
 };
 
-
 router.post('/signin', (req, res) => {
-
   const email = req.body.email || null;
   const password = req.body.password || null;
   const remember = req.body.remember || null;
@@ -68,63 +64,56 @@ router.post('/signin', (req, res) => {
                                   user.username, \
                                   user.email, \
                                   user.password, \
-                                  user.zipcode, \
-                                  DATE_FORMAT(CONVERT_TZ(user.creation_date, "+00:00", "America/Los_Angeles"), "%m/%d/%Y") AS creation_date, \
-                                  user.client_id as client_id, \
                                   user.reset_password as reset_password, \
                                   role.name AS role, \
                                   user.enabled as enabled\
                                   FROM user \
                                   INNER JOIN role ON role.id = user.role_id \
-                                  WHERE user.email = ? or user.username = ? or (user.phone = ? AND user.phone IS NOT NULL) \
+                                  WHERE (user.email = ? or user.username = ?) \
                                   AND user.enabled = "Y" \
-                                  order by user.id DESC',
-    [email, email, email],
+                                  LIMIT 1',
+    [email, email],
     async (err, rows, fields) => {
       if (!err) {
         console.log(rows);
         if (rows.length > 0) {
-          const validUsers = [];
-          for (const row of rows) {
-            if ((await bcryptjs.compare(password, row.password) || row.zipcode === password) && row.enabled == 'Y') {
-              const reset_password = row.reset_password;
-              let creation_date_aux = row.creation_date;
-              let last_name_aux = row.lastname;
-              delete row.reset_password;
-              delete row.password;
-              delete row.zipcode;
-              delete row.lastname;
-              delete row.creation_date;
-              let data = JSON.stringify(row);
-              console.log("los datos del token son: " + data);
-              try {
-                const token = await jwtSignAsync({ data }, process.env.JWT_SECRET, { expiresIn: '1h' });
-                validUsers.push({
-                  id: row.id,
-                  firstname: row.firstname,
-                  lastname: last_name_aux,
-                  creation_date: creation_date_aux,
-                  token: token,
-                  reset_password: reset_password
-                });
-              } catch (err) {
-                logger.error(err);
-                return res.status(500).send();
-              }
+          const user = rows[0];
+          
+          // Verificar password
+          const isPasswordValid = await bcryptjs.compare(password, user.password);
+          
+          if (isPasswordValid && user.enabled === 'Y') {
+            const reset_password = user.reset_password;
+            
+            // Limpiar datos sensibles antes de crear el token
+            delete user.reset_password;
+            delete user.password;
+            
+            let data = JSON.stringify(user);
+            console.log("los datos del token son: " + data);
+            
+            try {
+              // Determinar duración del token basado en remember
+              const tokenExpiration = remember === true ? '7d' : '1h';
+              
+              const token = await jwtSignAsync({ data }, process.env.JWT_SECRET, { expiresIn: tokenExpiration });
+              
+              logger.info(`user id: ${user.id} logueado - remember: ${remember} - token expires in: ${tokenExpiration}`);
+              res.status(200).json({ 
+                token: token, 
+                reset_password: reset_password 
+              });
+              
+            } catch (tokenErr) {
+              logger.error(tokenErr);
+              return res.status(500).send();
             }
-          }
-          if (validUsers.length === 1) {
-            logger.info(`user id: ${validUsers[0].id} logueado`);
-            res.status(200).json({ token: validUsers[0].token, reset_password: validUsers[0].reset_password });
-          } else if (validUsers.length > 1) {
-            logger.info(`multiple users found for ${email}`);
-            res.status(200).json(validUsers);
           } else {
-            logger.info(`user ${email} no logueado`);
+            logger.info(`user ${email} credenciales incorrectas`);
             res.status(401).send();
           }
         } else {
-          logger.info(`user ${email} no logueado`);
+          logger.info(`user ${email} no encontrado`);
           res.status(401).send();
         }
       } else {
@@ -133,7 +122,7 @@ router.post('/signin', (req, res) => {
         res.status(500).send();
       }
     }
-  )
+  );
 });
 
 router.get('/refresh-token', verifyToken, (req, res) => {
@@ -148,73 +137,6 @@ router.get('/refresh-token', verifyToken, (req, res) => {
   }
 });
 
-function formatDateForMailchimp(dateString) {
-  if (!dateString) return '';
-
-  // Asumiendo el string viene en formato YYYY-MM-DD
-  const [year, month, day] = dateString.split('-');
-  return `${month.padStart(2, '0')}/${day.padStart(2, '0')}`;
-}
-
-async function addSubscriberToMailchimp(userData) {
-  try {
-    // (1) Prepara el número de teléfono en formato E.164
-    //     en caso de que lo quieras normalizar. Por ejemplo:
-    const cleanPhone = userData.phone
-      ? `+1${userData.phone.replace(/\D/g, '')}`
-      : '';
-
-    // (2) Llama a la API de Mailchimp agregando 'sms_phone_number'
-    //     y 'sms_subscription_status' en el body principal
-    const response = await mailchimp.lists.addListMember(mailchimpAudienceId, {
-      // email_address: userData.email || `no-email-${Date.now()}@placeholder.com`,
-      email_address: userData.email || ``,
-      // status: userData.email ? 'subscribed' : 'unsubscribed',
-      status: userData.email ? 'subscribed' : '',
-
-      // Aquí agregas el número al campo nativo de SMS
-      sms_phone_number: cleanPhone,
-      sms_subscription_status: cleanPhone ? 'subscribed' : '',
-
-      // merge_fields para otros datos (nombre, apellido, etc.)
-      merge_fields: {
-        FNAME: userData.firstname || '',
-        LNAME: userData.lastname || '',
-        PHONE: userData.phone || '', // Este es tu merge field de “PHONE”
-        SMSPHONE: cleanPhone,
-        // SMSPHONE ya no tiene utilidad si queremos usar el nativo sms_phone_number.
-        ADDRESS: {
-          addr1: ',',
-          addr2: '',
-          city: ',',
-          state: 'CA',
-          zip: userData.zipcode || '',
-          country: 'USA'
-        },
-        BIRTHDAY: formatDateForMailchimp(userData.dateOfBirth),
-        MMERGE8: userData.gender || '',
-        MMERGE9: userData.ethnicity || '',
-        MMERGE10: userData.otherEthnicity || '',
-        EMAIL_CONSENT: userData.email ? 'yes' : 'no'
-      },
-
-      // Si lo deseas, puedes omitir sms_marketing_permission o dejarlo
-      // para forzar el “opt-in”. Depende de si tu cuenta de Mailchimp
-      // requiere un “double opt-in” específico para SMS.
-      // sms_marketing_permission: {
-      //   enabled: true,
-      //   company: "MAHI International, Inc.",
-      //   prefix: "+1"
-      // }
-    });
-
-    // console.log("response", response);
-    return response;
-  } catch (err) {
-    // console.log(err);
-    throw err;
-  }
-}
 
 router.post('/signup', async (req, res) => {
   // const cabecera = JSON.parse(req.data.data);
@@ -5773,262 +5695,6 @@ router.post('/table/user/client/download-csv', verifyToken, async (req, res) => 
 }
 );
 
-router.post('/table/user/beneficiary/download-csv', verifyToken, async (req, res) => {
-  const cabecera = JSON.parse(req.data.data);
-  if (cabecera.role === 'admin' || cabecera.role === 'client') {
-    try {
-      const filters = req.body;
-      let from_date = filters.from_date || '1970-01-01';
-      let to_date = filters.to_date || '2100-01-01';
-      const locations = filters.locations || [];
-      const genders = filters.genders || [];
-      const ethnicities = filters.ethnicities || [];
-      const min_age = filters.min_age || 0;
-      const max_age = filters.max_age || 150;
-      const zipcode = filters.zipcode || null;
-
-      // Convertir a formato ISO y obtener solo la fecha
-      if (filters.from_date) {
-        from_date = new Date(filters.from_date).toISOString().slice(0, 10);
-      }
-      if (filters.to_date) {
-        to_date = new Date(filters.to_date).toISOString().slice(0, 10);
-      }
-
-      var query_from_date = '';
-      if (filters.from_date) {
-        query_from_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') >= \'' + from_date + '\'';
-      }
-      var query_to_date = '';
-      if (filters.to_date) {
-        query_to_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') < DATE_ADD(\'' + to_date + '\', INTERVAL 1 DAY)';
-      }
-      var query_locations = '';
-      if (locations.length > 0) {
-        query_locations = 'AND (u.first_location_id IN (' + locations.join() + ') OR u.id IN (SELECT DISTINCT(db.receiving_user_id) FROM delivery_beneficiary db WHERE db.location_id IN (' + locations.join() + ')))';
-      }
-      var query_genders = '';
-      if (genders.length > 0) {
-        query_genders = 'AND u.gender_id IN (' + genders.join() + ')';
-      }
-      var query_ethnicities = '';
-      if (ethnicities.length > 0) {
-        query_ethnicities = 'AND u.ethnicity_id IN (' + ethnicities.join() + ')';
-      }
-      var query_min_age = '';
-      if (filters.min_age) {
-        query_min_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) >= ` + min_age;
-      }
-      var query_max_age = '';
-      if (filters.max_age) {
-        query_max_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) <= ` + max_age;
-      }
-      var query_zipcode = '';
-      if (filters.zipcode) {
-        query_zipcode = 'AND u.zipcode = ' + zipcode;
-      }
-
-      const [rows] = await mysqlConnection.promise().query(
-        `SELECT u.id,
-                u.username,
-                u.firstname,
-                u.lastname,
-                u.document,
-                DATE_FORMAT(u.date_of_birth, '%m/%d/%Y') AS date_of_birth,
-                u.email,
-                u.phone,
-                u.zipcode,
-                u.address,
-                g.name as gender,
-                e.name as ethnicity,
-                u.other_ethnicity,
-                u.household_size,
-                c.short_name as last_client_name,
-                l.community_city as last_location_visited,
-                u.reset_password,
-                u.enabled,
-                u.mailchimp_error,
-        DATE_FORMAT(CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y') AS creation_date,
-                        DATE_FORMAT(CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles'), '%T') AS creation_time,
-        DATE_FORMAT(CONVERT_TZ(u.modification_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y') AS modification_date,
-                        DATE_FORMAT(CONVERT_TZ(u.modification_date, '+00:00', 'America/Los_Angeles'), '%T') AS modification_time
-        FROM user as u
-        INNER JOIN ethnicity as e ON u.ethnicity_id = e.id
-        INNER JOIN gender as g ON u.gender_id = g.id
-        LEFT JOIN client as c ON u.client_id = c.id
-        LEFT JOIN client_user as cu ON u.id = cu.user_id
-        LEFT JOIN location as l ON u.location_id = l.id
-        WHERE u.role_id = 5 AND CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles') >= ? AND CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles') < DATE_ADD(?, INTERVAL 1 DAY)
-        ${query_locations}
-        ${query_genders}
-        ${query_ethnicities}
-        ${query_min_age}
-        ${query_max_age}
-        ${query_zipcode}
-        ${cabecera.role === 'client' ? ' AND cu.client_id = ?' : ''}
-        GROUP BY u.id
-        ORDER BY u.id`,
-        [from_date, to_date, cabecera.client_id]
-      );
-
-      var headers_array = [
-        { id: 'id', title: 'ID' },
-        { id: 'username', title: 'Username' },
-        { id: 'firstname', title: 'Firstname' },
-        { id: 'lastname', title: 'Lastname' },
-        { id: 'document', title: 'Document' },
-        { id: 'date_of_birth', title: 'Date of birth' },
-        { id: 'email', title: 'Email' },
-        { id: 'phone', title: 'Phone' },
-        { id: 'zipcode', title: 'Zipcode' },
-        { id: 'address', title: 'Address' },
-        { id: 'gender', title: 'Gender' },
-        { id: 'ethnicity', title: 'Ethnicity' },
-        { id: 'other_ethnicity', title: 'Other ethnicity' },
-        { id: 'household_size', title: 'Household size' },
-        { id: 'last_client_name', title: 'Last client name' },
-        { id: 'last_location_visited', title: 'Last location visited' },
-        { id: 'reset_password', title: 'Reset password' },
-        { id: 'enabled', title: 'Enabled' },
-        { id: 'mailchimp_error', title: 'Mailchimp error' },
-        { id: 'creation_date', title: 'Creation date' },
-        { id: 'creation_time', title: 'Creation time' },
-        { id: 'modification_date', title: 'Modification date' },
-        { id: 'modification_time', title: 'Modification time' }
-      ];
-
-      const csvStringifier = createCsvStringifier({
-        header: headers_array,
-        fieldDelimiter: ';'
-      });
-
-      let csvData = csvStringifier.getHeaderString();
-      csvData += csvStringifier.stringifyRecords(rows);
-
-      res.setHeader('Content-disposition', 'attachment; filename=participants-table.csv');
-      res.setHeader('Content-type', 'text/csv; charset=utf-8');
-      res.send(csvData);
-
-    } catch (err) {
-      console.log(err);
-      res.status(500).json('Internal server error');
-    }
-  }
-}
-);
-
-router.post('/table/user/beneficiary/download-csv-mailchimp', verifyToken, async (req, res) => {
-  const cabecera = JSON.parse(req.data.data);
-  if (cabecera.role === 'admin') {
-    try {
-      const filters = req.body;
-      let from_date = filters.from_date || '1970-01-01';
-      let to_date = filters.to_date || '2100-01-01';
-      const locations = filters.locations || [];
-      const genders = filters.genders || [];
-      const ethnicities = filters.ethnicities || [];
-      const min_age = filters.min_age || 0;
-      const max_age = filters.max_age || 150;
-      const zipcode = filters.zipcode || null;
-
-      // Convertir a formato ISO y obtener solo la fecha
-      if (filters.from_date) {
-        from_date = new Date(filters.from_date).toISOString().slice(0, 10);
-      }
-      if (filters.to_date) {
-        to_date = new Date(filters.to_date).toISOString().slice(0, 10);
-      }
-
-      var query_from_date = '';
-      if (filters.from_date) {
-        query_from_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') >= \'' + from_date + '\'';
-      }
-      var query_to_date = '';
-      if (filters.to_date) {
-        query_to_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') < DATE_ADD(\'' + to_date + '\', INTERVAL 1 DAY)';
-      }
-      var query_locations = '';
-      if (locations.length > 0) {
-        query_locations = 'AND (u.first_location_id IN (' + locations.join() + ') OR u.id IN (SELECT DISTINCT(db.receiving_user_id) FROM delivery_beneficiary db WHERE db.location_id IN (' + locations.join() + ')))';
-      }
-      var query_genders = '';
-      if (genders.length > 0) {
-        query_genders = 'AND u.gender_id IN (' + genders.join() + ')';
-      }
-      var query_ethnicities = '';
-      if (ethnicities.length > 0) {
-        query_ethnicities = 'AND u.ethnicity_id IN (' + ethnicities.join() + ')';
-      }
-      var query_min_age = '';
-      if (filters.min_age) {
-        query_min_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) >= ` + min_age;
-      }
-      var query_max_age = '';
-      if (filters.max_age) {
-        query_max_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) <= ` + max_age;
-      }
-      var query_zipcode = '';
-      if (filters.zipcode) {
-        query_zipcode = 'AND u.zipcode = ' + zipcode;
-      }
-
-      const [rows] = await mysqlConnection.promise().query(
-        `SELECT u.id,
-                u.firstname,
-                u.lastname,
-                DATE_FORMAT(u.date_of_birth, '%m/%d/%Y') AS date_of_birth,
-                u.email,
-                u.phone,
-                u.zipcode,
-                u.address,
-                g.name as gender,
-                e.name as ethnicity
-        FROM user as u
-        INNER JOIN ethnicity as e ON u.ethnicity_id = e.id
-        INNER JOIN gender as g ON u.gender_id = g.id
-        WHERE u.role_id = 5 AND CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles') >= ? AND CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles') < DATE_ADD(?, INTERVAL 1 DAY)
-        ${query_locations}
-        ${query_genders}
-        ${query_ethnicities}
-        ${query_min_age}
-        ${query_max_age}
-        ${query_zipcode}
-        GROUP BY u.id
-        ORDER BY u.id`,
-        [from_date, to_date]
-      );
-
-      var headers_array = [
-        { id: 'email', title: 'Email' },
-        { id: 'firstname', title: 'First Name' },
-        { id: 'lastname', title: 'Last Name' },
-        { id: 'date_of_birth', title: 'Birthday' },
-        { id: 'phone', title: 'Phone' },
-        { id: 'zipcode', title: 'Address - ZIP/Postal' },
-        { id: 'gender', title: 'Gender' },
-        { id: 'ethnicity', title: 'Ethnicity' },
-      ];
-
-      const csvStringifier = createCsvStringifier({
-        header: headers_array,
-        fieldDelimiter: ','
-      });
-
-      let csvData = csvStringifier.getHeaderString();
-      csvData += csvStringifier.stringifyRecords(rows);
-
-      res.setHeader('Content-disposition', 'attachment; filename=participants-table-mailchimp.csv');
-      res.setHeader('Content-type', 'text/csv; charset=utf-8');
-      res.send(csvData);
-
-    } catch (err) {
-      console.log(err);
-      res.status(500).json('Internal server error');
-    }
-  }
-}
-);
-
 router.post('/table/client/download-csv', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (cabecera.role === 'admin') {
@@ -10638,213 +10304,7 @@ router.get('/table/notification', verifyToken, async (req, res) => {
   }
 });
 
-router.post('/table/user', verifyToken, async (req, res) => {
-  const cabecera = JSON.parse(req.data.data);
 
-  if (cabecera.role === 'admin' || cabecera.role === 'client') {
-    const filters = req.body;
-    let from_date = filters.from_date || '1970-01-01';
-    let to_date = filters.to_date || '2100-01-01';
-    const locations = filters.locations || [];
-    const genders = filters.genders || [];
-    const ethnicities = filters.ethnicities || [];
-    const min_age = filters.min_age || 0;
-    const max_age = filters.max_age || 150;
-    const zipcode = filters.zipcode || null;
-    const register_form = filters.register_form || null;
-
-    // Convertir a formato ISO y obtener solo la fecha
-    if (filters.from_date) {
-      from_date = new Date(filters.from_date).toISOString().slice(0, 10);
-    }
-    if (filters.to_date) {
-      to_date = new Date(filters.to_date).toISOString().slice(0, 10);
-    }
-
-    var query_from_date = '';
-    if (filters.from_date) {
-      query_from_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') >= \'' + from_date + '\'';
-    }
-    var query_to_date = '';
-    if (filters.to_date) {
-      query_to_date = 'AND CONVERT_TZ(u.creation_date, \'+00:00\', \'America/Los_Angeles\') < DATE_ADD(\'' + to_date + '\', INTERVAL 1 DAY)';
-    }
-    var query_locations = '';
-
-    var query_genders = '';
-    if (genders.length > 0) {
-      query_genders = 'AND u.gender_id IN (' + genders.join() + ')';
-    }
-    var query_ethnicities = '';
-    if (ethnicities.length > 0) {
-      query_ethnicities = 'AND u.ethnicity_id IN (' + ethnicities.join() + ')';
-    }
-    var query_min_age = '';
-    if (filters.min_age) {
-      query_min_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) >= ` + min_age;
-    }
-    var query_max_age = '';
-    if (filters.max_age) {
-      query_max_age = `AND TIMESTAMPDIFF(YEAR, u.date_of_birth, DATE(CONVERT_TZ(NOW(), '+00:00', 'America/Los_Angeles'))) <= ` + max_age;
-    }
-    var query_zipcode = '';
-    if (filters.zipcode) {
-      query_zipcode = 'AND u.zipcode = ' + zipcode;
-    }
-    var query_register_form = '';
-
-    let buscar = req.query.search;
-    let queryBuscar = '';
-    var queryTableRole = '';
-
-    var page = req.query.page ? Number(req.query.page) : 1;
-
-    if (page < 1) {
-      page = 1;
-    }
-    var resultsPerPage = 10;
-    var start = (page - 1) * resultsPerPage;
-
-    var orderBy = req.query.orderBy ? req.query.orderBy : 'id';
-    var orderType = ['asc', 'desc'].includes(req.query.orderType) ? req.query.orderType : 'desc';
-    var queryOrderBy = `${orderBy} ${orderType}`;
-
-    if (buscar) {
-      buscar = '%' + buscar + '%';
-      queryBuscar = `AND (u.id like '${buscar}' or u.username like '${buscar}' or u.email like '${buscar}' or u.firstname like '${buscar}' or u.lastname like '${buscar}' or role.name like '${buscar}' or u.enabled like '${buscar}' or DATE_FORMAT(CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') like '${buscar}')`;
-    }
-
-    var tableRole = req.query.tableRole;
-
-    if (tableRole) {
-      switch (tableRole) {
-        case 'all':
-          queryTableRole = 'AND (role.id != 2 AND role.id != 5)';
-          if (locations.length > 0) {
-            query_locations = 'AND (u.first_location_id IN (' + locations.join() + ') OR u.id IN (SELECT DISTINCT(db.delivering_user_id) FROM delivery_beneficiary db WHERE db.location_id IN (' + locations.join() + ')))';
-          }
-          break;
-        case 'beneficiary':
-          queryTableRole = 'AND role.id = 5';
-          if (locations.length > 0) {
-            query_locations = 'AND (u.first_location_id IN (' + locations.join() + ') OR u.id IN (SELECT DISTINCT(db.receiving_user_id) FROM delivery_beneficiary db WHERE db.location_id IN (' + locations.join() + ')))';
-          }
-          if (filters.register_form) {
-            const conditions = [];
-            for (const [question_id, content] of Object.entries(register_form)) {
-              if (Array.isArray(content)) {
-                if (content.length > 0) {
-                  conditions.push(`u.id IN (
-                                          SELECT uq.user_id 
-                                          FROM user_question AS uq
-                                          INNER JOIN user_question_answer AS uqa ON uq.id = uqa.user_question_id
-                                          WHERE uqa.answer_id IN (${content.join()}) AND uq.question_id = ${question_id}
-                                        )`);
-                }
-              } else if (content) {
-                conditions.push(`u.id IN (
-                                          SELECT uq.user_id 
-                                          FROM user_question AS uq
-                                          INNER JOIN user_question_answer AS uqa ON uq.id = uqa.user_question_id
-                                          WHERE uqa.answer_id = ${content} AND uq.question_id = ${question_id}
-                                        )`);
-              }
-            }
-            if (conditions.length > 0) {
-              query_register_form = `AND (${conditions.join(' AND ')})`;
-            }
-          }
-
-          if (cabecera.role === 'client') {
-            queryTableRole += ' AND client_user.client_id = ' + cabecera.client_id;
-          }
-          break;
-        case 'client':
-          queryTableRole = 'AND role.id = 2';
-          if (locations.length > 0) {
-            query_locations = 'AND cl.location_id IN (' + locations.join() + ')';
-          }
-          if (cabecera.role === 'client') {
-            queryTableRole += ' AND u.client_id = ' + cabecera.client_id;
-          }
-          break;
-        default:
-          queryTableRole = '';
-      }
-    }
-    try {
-      const query = `SELECT
-      u.id,
-      u.username,
-      u.email,
-      u.firstname,
-      u.lastname,
-      role.name as role,
-      u.enabled,
-      u.mailchimp_error,
-      DATE_FORMAT(CONVERT_TZ(u.creation_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') as creation_date
-      FROM user as u
-      INNER JOIN role ON u.role_id = role.id
-      ${cabecera.role === 'client' && tableRole === 'beneficiary' ? 'INNER JOIN client_user ON u.id = client_user.user_id' : ''}
-      ${tableRole === 'client' ? 'INNER JOIN client as c ON u.client_id = c.id LEFT JOIN client_location as cl ON c.id = cl.client_id' : ''}
-      WHERE 1=1 
-      ${queryBuscar}
-      ${queryTableRole}
-      ${query_from_date}
-      ${query_to_date}
-      ${query_locations}
-      ${query_genders}
-      ${query_ethnicities}
-      ${query_min_age}
-      ${query_max_age}
-      ${query_zipcode}
-      ${query_register_form}
-      ${tableRole === 'client' ? 'GROUP BY u.id' : ''}
-      ORDER BY ${queryOrderBy}
-      LIMIT ?, ?`
-
-      const [rows] = await mysqlConnection.promise().query(
-        query
-        , [start, resultsPerPage]);
-      if (rows.length > 0) {
-        const [countRows] = await mysqlConnection.promise().query(`
-          SELECT COUNT(*) as count
-          FROM user as u
-          INNER JOIN role ON u.role_id = role.id
-          ${cabecera.role === 'client' && tableRole === 'beneficiary' ? 'INNER JOIN client_user ON u.id = client_user.user_id' : ''}
-          ${tableRole === 'client' ? 'INNER JOIN client as c ON u.client_id = c.id LEFT JOIN client_location as cl ON c.id = cl.client_id' : ''}
-          WHERE 1=1
-          ${queryBuscar}
-          ${queryTableRole}
-          ${query_from_date}
-          ${query_to_date}
-          ${query_locations}
-          ${query_genders}
-          ${query_ethnicities}
-          ${query_min_age}
-          ${query_max_age}
-          ${query_zipcode}
-          ${query_register_form}
-          ${tableRole === 'client' ? 'GROUP BY u.id' : ''}
-        `);
-
-        const numOfResults = countRows[0].count;
-        const numOfPages = Math.ceil(numOfResults / resultsPerPage);
-
-        res.json({ results: rows, numOfPages: numOfPages, totalItems: numOfResults, page: page - 1, orderBy: orderBy, orderType: orderType });
-      } else {
-        res.json({ results: rows, numOfPages: 0, totalItems: 0, page: page - 1, orderBy: orderBy, orderType: orderType });
-      }
-
-    } catch (error) {
-      console.log(error);
-      logger.error(error);
-      res.status(500).json('Error interno');
-    }
-  } else {
-    res.status(401).json('No autorizado');
-  }
-});
 router.post('/table/volunteer', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
 
@@ -13685,35 +13145,6 @@ router.put('/enable-disable/:id', verifyToken, async (req, res) => {
   }
 });
 
-router.put('/mailchimp/error/enable-disable/:id', verifyToken, async (req, res) => {
-  const cabecera = JSON.parse(req.data.data);
-
-  if (cabecera.role === 'admin') {
-    const { id } = req.params;
-    const { enabled } = req.body;
-
-    if (id && enabled) {
-      try {
-        const [rows] = await mysqlConnection.promise().query(
-          `update user set mailchimp_error = ? where id = ?`,
-          [enabled, id]
-        );
-        if (rows.affectedRows > 0) {
-          res.json('Registro actualizado correctamente');
-        } else {
-          res.status(500).json('No se pudo actualizar el registro');
-        }
-      } catch (err) {
-        console.log(err);
-        res.status(500).json('Internal server error');
-      }
-    } else {
-      res.status(400).json('Faltan datos');
-    }
-  } else {
-    res.status(401).send();
-  }
-});
 
 function verifyToken(req, res, next) {
 
