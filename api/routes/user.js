@@ -78,32 +78,32 @@ router.post('/signin', (req, res) => {
         console.log(rows);
         if (rows.length > 0) {
           const user = rows[0];
-          
+
           // Verificar password
           const isPasswordValid = await bcryptjs.compare(password, user.password);
-          
+
           if (isPasswordValid && user.enabled === 'Y') {
             const reset_password = user.reset_password;
-            
+
             // Limpiar datos sensibles antes de crear el token
             delete user.reset_password;
             delete user.password;
-            
+
             let data = JSON.stringify(user);
             console.log("los datos del token son: " + data);
-            
+
             try {
               // Determinar duración del token basado en remember
               const tokenExpiration = remember === true ? '7d' : '1h';
-              
+
               const token = await jwtSignAsync({ data }, process.env.JWT_SECRET, { expiresIn: tokenExpiration });
-              
+
               logger.info(`user id: ${user.id} logueado - remember: ${remember} - token expires in: ${tokenExpiration}`);
-              res.status(200).json({ 
-                token: token, 
-                reset_password: reset_password 
+              res.status(200).json({
+                token: token,
+                reset_password: reset_password
               });
-              
+
             } catch (tokenErr) {
               logger.error(tokenErr);
               return res.status(500).send();
@@ -123,6 +123,37 @@ router.post('/signin', (req, res) => {
       }
     }
   );
+});
+
+router.get('/categories', verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  if (cabecera.role === 'admin') {
+    try {
+      const { lang = 'en' } = req.query; // Idioma por defecto: inglés
+
+      // Consulta SQL que incluye filtrado por idioma si tienes campos multiidioma
+      const query = `
+      SELECT 
+      id,
+      ${lang === 'en' ? 'name' : 'name_es'} AS name
+      FROM categories
+      ORDER BY name ASC
+    `;
+
+      const [rows] = await mysqlConnection.promise().query(query, [lang]);
+
+      if (rows.length > 0) {
+        res.status(200).json(rows);
+      } else {
+        res.status(404).json('categories not found');
+      }
+    } catch (err) {
+      console.log(err);
+      res.status(500).json('Internal server error');
+    }
+  } else {
+    res.status(401).json('Unauthorized');
+  }
 });
 
 router.get('/refresh-token', verifyToken, (req, res) => {
@@ -8083,7 +8114,7 @@ router.post('/metrics/participant/register', verifyToken, async (req, res) => {
       if (locations.length > 0) {
         query_locations_recurring_delivery = `AND db_range.location_id IN (${locations.map(Number).join(',')})`;
       }
-      
+
       // Location filter for original 'recurring' logic (checks db_prev_original.location_id for deliveries prior to current one)
       let original_recurring_location_condition_sql = '';
       if (locations.length > 0) {
@@ -8138,7 +8169,7 @@ router.post('/metrics/participant/register', verifyToken, async (req, res) => {
       // Params for the new type of recurring:
       params_metrics_participant.push(from_date); // For u.creation_date < ?
       params_metrics_participant.push(from_date); // For db_no_past.creation_date < ?
-      
+
       if (cabecera.role === 'client') {
         params_metrics_participant.push(cabecera.client_id);
       }
@@ -8817,14 +8848,14 @@ router.post('/metrics/participant/register_history', verifyToken, async (req, re
               SELECT creation_date FROM delivery_beneficiary
             ) AS combined_dates`
           );
-        to_date = dateRange[0].max_date ? new Date(dateRange[0].max_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0,10);
+        to_date = dateRange[0].max_date ? new Date(dateRange[0].max_date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
       }
 
       const isValidDate = (date) => /^\d{4}-\d{2}-\d{2}$/.test(date);
       if (!isValidDate(from_date) || !isValidDate(to_date)) {
         return res.status(400).send('Invalid date format.');
       }
-      
+
       const from_date_param_original = from_date;
       const to_date_obj_for_exclusive = new Date(to_date);
       to_date_obj_for_exclusive.setDate(to_date_obj_for_exclusive.getDate() + 1);
@@ -8904,7 +8935,7 @@ router.post('/metrics/participant/register_history', verifyToken, async (req, re
         query_locations_recurring_delivery_history = `AND db_current.location_id IN (${locations.map(() => '?').join(',')})`;
         location_params_for_recurring_delivery.push(...locations.map(Number));
       }
-      
+
       let original_recurring_location_condition_sql_history = '';
       const location_params_for_original_recurring = [];
       if (locations.length > 0) {
@@ -8913,13 +8944,13 @@ router.post('/metrics/participant/register_history', verifyToken, async (req, re
       }
 
       const newUsersParams = [
-        from_date_param_original, 
+        from_date_param_original,
         to_date_exclusive_param,
         ...demographicParams,
         ...clientParams, // clientParams for clientConditionSql
         ...location_params_for_first_location
       ];
-      
+
       const newUsersQuery = `
         SELECT
           ${periodExpressionUser} AS period,
@@ -8935,7 +8966,7 @@ router.post('/metrics/participant/register_history', verifyToken, async (req, re
           ${query_locations_new_user_first_location_history}
         GROUP BY period
       `;
-      
+
       const recurringUsersParams = [
         from_date_param_original,
         to_date_exclusive_param,
@@ -9009,7 +9040,7 @@ router.post('/metrics/participant/register_history', verifyToken, async (req, re
       const categories = Array.from(periodsMap.keys());
       const newUsersData = categories.map(period => periodsMap.get(period).new_users);
       const recurringUsersData = categories.map(period => periodsMap.get(period).recurring_users);
-      
+
       const formattedCategories = categories.map(c => formatPeriod(c, interval, language));
 
 
@@ -9314,8 +9345,8 @@ router.post('/metrics/participant/location_new_recurring', verifyToken, async (r
 // Funciones auxiliares
 function generatePeriods(startDate, endDate, interval) {
   const periods = [];
-  let current = new Date(new Date(startDate + 'T00:00:00.000Z').toLocaleString("en-US", {timeZone: "America/Los_Angeles"}));
-  const end = new Date(new Date(endDate + 'T00:00:00.000Z').toLocaleString("en-US", {timeZone: "America/Los_Angeles"}));
+  let current = new Date(new Date(startDate + 'T00:00:00.000Z').toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
+  const end = new Date(new Date(endDate + 'T00:00:00.000Z').toLocaleString("en-US", { timeZone: "America/Los_Angeles" }));
 
   while (current <= end) {
     let period;
@@ -9337,7 +9368,7 @@ function generatePeriods(startDate, endDate, interval) {
         const weekYear = tempDateForWeek.getFullYear();
         const firstDayOfYear = new Date(weekYear, 0, 1);
         const pastDaysOfYear = (tempDateForWeek - firstDayOfYear) / 86400000;
-        const weekNumber = String(Math.ceil((pastDaysOfYear + firstDayOfYear.getDay() + 1) / 7)).padStart(2,'0');
+        const weekNumber = String(Math.ceil((pastDaysOfYear + firstDayOfYear.getDay() + 1) / 7)).padStart(2, '0');
         period = `${weekYear}-W${weekNumber}`; // Approximation
         current.setDate(current.getDate() + 7);
         break;
