@@ -1739,6 +1739,107 @@ router.get('/summary/priority', async (req, res) => {
   }
 });
 
+// Get paginated articles summary
+router.get('/summary/articles', async (req, res) => {
+  try {
+    const { language = 'en', page = 1, limit = 10 } = req.query;
+
+    // Validate language parameter
+    if (!['en', 'es'].includes(language)) {
+      return res.status(400).json('Invalid language parameter. Must be "en" or "es"');
+    }
+
+    // Validate pagination parameters
+    const pageNumber = parseInt(page);
+    const limitNumber = parseInt(limit);
+    
+    if (isNaN(pageNumber) || pageNumber < 1) {
+      return res.status(400).json('Invalid page parameter');
+    }
+    
+    if (isNaN(limitNumber) || limitNumber < 1 || limitNumber > 100) {
+      return res.status(400).json('Invalid limit parameter. Must be between 1 and 100');
+    }
+
+    const offset = (pageNumber - 1) * limitNumber;
+
+    // Get total count for pagination
+    const [countResult] = await mysqlConnection.promise().query(
+      `SELECT COUNT(*) as total 
+       FROM article 
+       WHERE article_status_id = 2 
+         AND (title_en IS NOT NULL AND title_en != '') 
+         AND (title_es IS NOT NULL AND title_es != '')`
+    );
+    const totalCount = countResult[0].total;
+
+    // Query articles with pagination and preview images
+    const titleField = language === 'en' ? 'title_en' : 'title_es';
+    const subtitleField = language === 'en' ? 'subtitle_en' : 'subtitle_es';
+    const slugField = language === 'en' ? 'slug_en' : 'slug_es';
+    const imageType = language === 'en' ? 'preview_en' : 'preview_es';
+
+    const query = `
+      SELECT 
+        ${titleField} as title,
+        ${subtitleField} as subtitle,
+        ${slugField} as slug,
+        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%Y-%m-%d') as publication_date,
+        a.author,
+        ai.s3_key as image_s3_key
+      FROM article a
+      LEFT JOIN article_images ai ON a.id = ai.article_id AND ai.image_type = ?
+      WHERE a.article_status_id = 2
+        AND ${titleField} IS NOT NULL 
+        AND ${titleField} != ''
+        AND a.priority IS NULL
+      ORDER BY a.publication_date DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const [articles] = await mysqlConnection.promise().query(query, [imageType, limitNumber, offset]);
+
+    // Format response with signed URLs for images
+    const formattedArticles = await Promise.all(articles.map(async (article) => {
+      let imageUrl = '';
+      
+      // Generate signed URL for image if available
+      if (article.image_s3_key) {
+        const signedUrl = await getSignedUrlForImage(article.image_s3_key);
+        imageUrl = signedUrl || '';
+      }
+
+      return {
+        title: article.title,
+        subtitle: article.subtitle || '',
+        author: article.author,
+        image: imageUrl,
+        publication_date: article.publication_date,
+        slug: article.slug
+      };
+    }));
+
+    // Calculate pagination info
+    const totalPages = Math.ceil(totalCount / limitNumber);
+    const hasNext = pageNumber < totalPages;
+    
+    const response = {
+      articles: formattedArticles,
+      totalCount: totalCount,
+      currentPage: pageNumber,
+      totalPages: totalPages,
+      hasNext: hasNext
+    };
+    console.log("response:", response)
+    res.json(response);
+
+  } catch (error) {
+    console.error('Error fetching summary articles:', error);
+    logger.error('Error fetching summary articles:', error);
+    res.status(500).json('Internal server error');
+  }
+});
+
 // ================= END SUMMARY ENDPOINTS =================
 
 function verifyToken(req, res, next) {
