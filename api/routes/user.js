@@ -1636,11 +1636,13 @@ router.get('/summary/opinion', async (req, res) => {
     // Query opinion articles (category_id = 5) with basic info
     const titleField = language === 'en' ? 'title_en' : 'title_es';
     const subtitleField = language === 'en' ? 'subtitle_en' : 'subtitle_es';
+    const slugField = language === 'en' ? 'slug_en' : 'slug_es';
 
     const query = `
       SELECT 
         ${titleField} as title,
         ${subtitleField} as subtitle,
+        ${slugField} as slug,
         author,
         author_gender
       FROM article 
@@ -1658,6 +1660,7 @@ router.get('/summary/opinion', async (req, res) => {
     const formattedArticles = articles.map(article => ({
       title: article.title,
       subtitle: article.subtitle || '',
+      slug: article.slug,
       author: article.author,
       author_gender: article.author_gender
     }));
