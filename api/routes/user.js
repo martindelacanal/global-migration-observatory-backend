@@ -1674,6 +1674,71 @@ router.get('/summary/opinion', async (req, res) => {
   }
 });
 
+// Get priority articles summary
+router.get('/summary/priority', async (req, res) => {
+  try {
+    const { language = 'en' } = req.query;
+
+    // Validate language parameter
+    if (!['en', 'es'].includes(language)) {
+      return res.status(400).json('Invalid language parameter. Must be "en" or "es"');
+    }
+
+    // Query priority articles with basic info and preview images
+    const titleField = language === 'en' ? 'title_en' : 'title_es';
+    const subtitleField = language === 'en' ? 'subtitle_en' : 'subtitle_es';
+    const imageType = language === 'en' ? 'preview_en' : 'preview_es';
+    const slugField = language === 'en' ? 'slug_en' : 'slug_es';
+
+    const query = `
+      SELECT 
+        a.priority,
+        ${titleField} as title,
+        ${subtitleField} as subtitle,
+        ${slugField} as slug,
+        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y') as date,
+        a.author,
+        ai.s3_key as image_s3_key
+      FROM article a
+      LEFT JOIN article_images ai ON a.id = ai.article_id AND ai.image_type = ?
+      WHERE a.priority IS NOT NULL 
+        AND a.article_status_id = 2
+        AND ${titleField} IS NOT NULL 
+        AND ${titleField} != ''
+      ORDER BY a.priority ASC
+    `;
+
+    const [articles] = await mysqlConnection.promise().query(query, [imageType]);
+
+    // Format response with signed URLs for images
+    const formattedArticles = await Promise.all(articles.map(async (article) => {
+      let imageUrl = null;
+      
+      // Generate signed URL for image if available
+      if (article.image_s3_key) {
+        imageUrl = await getSignedUrlForImage(article.image_s3_key);
+      }
+
+      return {
+        priority: article.priority,
+        title: article.title,
+        subtitle: article.subtitle || undefined,
+        slug: article.slug || undefined,
+        image: imageUrl || undefined,
+        date: article.date,
+        author: article.author
+      };
+    }));
+
+    res.json(formattedArticles);
+
+  } catch (error) {
+    console.error('Error fetching priority articles summary:', error);
+    logger.error('Error fetching priority articles summary:', error);
+    res.status(500).json('Internal server error');
+  }
+});
+
 // ================= END SUMMARY ENDPOINTS =================
 
 function verifyToken(req, res, next) {
