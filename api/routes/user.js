@@ -110,11 +110,9 @@ router.post('/signin', (req, res) => {
               return res.status(500).send();
             }
           } else {
-            logger.info(`user ${email} credenciales incorrectas`);
             res.status(401).send();
           }
         } else {
-          logger.info(`user ${email} no encontrado`);
           res.status(401).send();
         }
       } else {
@@ -552,7 +550,6 @@ async function cleanupOrphanedContentImages(articleId, newContentEn, newContentE
         imageIds
       );
 
-      logger.info(`Cleaned up ${imagesToDelete.length} orphaned content images for article ${articleId}`);
     }
 
   } catch (error) {
@@ -595,6 +592,137 @@ async function replaceS3KeysWithSignedUrls(content) {
   } catch (error) {
     logger.error('Error replacing S3 keys with signed URLs:', error);
     return content; // Return original content if processing fails
+  }
+}
+
+// Helper function to manage article priorities (1-8, unique values)
+async function managePriority(newPriority, excludeArticleId = null) {
+  try {
+    // If no priority is set, return null
+    if (!newPriority || newPriority < 1 || newPriority > 8) {
+      return null;
+    }
+
+    const priority = parseInt(newPriority);
+
+    // Get the current priority of the article being updated (if any)
+    let currentPriority = null;
+    if (excludeArticleId) {
+      const [currentArticle] = await mysqlConnection.promise().query(
+        'SELECT priority FROM article WHERE id = ?',
+        [excludeArticleId]
+      );
+      if (currentArticle.length > 0) {
+        currentPriority = currentArticle[0].priority;
+      }
+    }
+
+    // Check if the priority already exists (excluding the current article being updated)
+    let existingQuery = 'SELECT id FROM article WHERE priority = ?';
+    let existingParams = [priority];
+    
+    if (excludeArticleId) {
+      existingQuery += ' AND id != ?';
+      existingParams.push(excludeArticleId);
+    }
+
+    const [existingArticle] = await mysqlConnection.promise().query(existingQuery, existingParams);
+
+    // If priority doesn't exist, we can use it directly
+    if (existingArticle.length === 0) {
+      return priority;
+    }
+
+    // Start a transaction for atomic priority updates
+    const connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    try {
+      // Case 1: Creating new article or article without previous priority
+      if (!excludeArticleId || currentPriority === null) {
+        
+        // Get all articles with priority >= newPriority and shift them down
+        const [articlesToShift] = await connection.query(
+          'SELECT id, priority FROM article WHERE priority >= ? AND priority IS NOT NULL ORDER BY priority DESC',
+          [priority]
+        );
+        
+        for (const article of articlesToShift) {
+          const newPriorityValue = article.priority + 1;
+          
+          if (newPriorityValue > 8) {
+            await connection.query(
+              'UPDATE article SET priority = NULL WHERE id = ?',
+              [article.id]
+            );
+          } else {
+            await connection.query(
+              'UPDATE article SET priority = ? WHERE id = ?',
+              [newPriorityValue, article.id]
+            );
+          }
+        }
+      }
+      // Case 2: Article is moving from one priority to another
+      else {
+        
+        if (currentPriority < priority) {
+          // Moving to a higher priority number (lower importance)
+          // Shift articles between currentPriority+1 and newPriority up by 1
+          
+          const [articlesToShift] = await connection.query(
+            'SELECT id, priority FROM article WHERE priority > ? AND priority <= ? AND priority IS NOT NULL AND id != ? ORDER BY priority ASC',
+            [currentPriority, priority, excludeArticleId]
+          );
+          
+          for (const article of articlesToShift) {
+            const newPriorityValue = article.priority - 1;
+            await connection.query(
+              'UPDATE article SET priority = ? WHERE id = ?',
+              [newPriorityValue, article.id]
+            );
+          }
+        } else if (currentPriority > priority) {
+          // Moving to a lower priority number (higher importance)
+          // Shift articles between newPriority and currentPriority-1 down by 1
+          
+          const [articlesToShift] = await connection.query(
+            'SELECT id, priority FROM article WHERE priority >= ? AND priority < ? AND priority IS NOT NULL AND id != ? ORDER BY priority DESC',
+            [priority, currentPriority, excludeArticleId]
+          );
+          
+          for (const article of articlesToShift) {
+            const newPriorityValue = article.priority + 1;
+            
+            if (newPriorityValue > 8) {
+              await connection.query(
+                'UPDATE article SET priority = NULL WHERE id = ?',
+                [article.id]
+              );
+            } else {
+              await connection.query(
+                'UPDATE article SET priority = ? WHERE id = ?',
+                [newPriorityValue, article.id]
+              );
+            }
+          }
+        }
+        // If currentPriority === priority, no shifts needed (shouldn't happen due to earlier check)
+      }
+
+      await connection.commit();
+      connection.release();
+      return priority;
+
+    } catch (shiftError) {
+      await connection.rollback();
+      connection.release();
+      throw shiftError;
+    }
+
+  } catch (error) {
+    logger.error('Error managing article priority:', error);
+    throw error;
   }
 }
 
@@ -661,6 +789,9 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
     // Format publication date
     const publicationDate = new Date(date).toISOString().slice(0, 19).replace('T', ' ');
 
+    // Manage priority (ensure uniqueness and shift if necessary)
+    const managedPriority = await managePriority(priority);
+
     // Insert article first to get ID
     const [articleResult] = await mysqlConnection.promise().query(
       `INSERT INTO article (
@@ -671,7 +802,7 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
       [
         titleEnglish, titleSpanish, subtitleEnglish || null, subtitleSpanish || null,
         contentEnglish, contentSpanish, author, author_gender, publicationDate, categoryId,
-        priority || null, article_status_id || 1, slugEn, slugEs
+        managedPriority, article_status_id || 1, slugEn, slugEs
       ]
     );
 
@@ -699,7 +830,6 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
 
     let imageEnglishUrl = null;
     let imageSpanishUrl = null;
-
     // Upload preview images if provided
     if (req.files?.imageEnglish) {
       try {
@@ -719,6 +849,7 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
     }
 
     if (req.files?.imageSpanish) {
+      console.log(req.files.imageSpanish[0]);
       try {
         const imageResult = await uploadArticleImage(
           req.files.imageSpanish[0], 
@@ -752,7 +883,7 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
       author_gender,
       date: publicationDate,
       categoryId: parseInt(categoryId),
-      priority: priority ? parseInt(priority) : null,
+      priority: managedPriority,
       article_status_id: parseInt(article_status_id) || 1,
       imageEnglishUrl,
       imageSpanishUrl,
@@ -1190,6 +1321,9 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
     // Format publication date
     const publicationDate = new Date(date).toISOString().slice(0, 19).replace('T', ' ');
 
+    // Manage priority (ensure uniqueness and shift if necessary, excluding current article)
+    const managedPriority = await managePriority(priority, id);
+
     // Process content images (convert base64 to S3 URLs)
     let processedContentEnglish = contentEnglish;
     let processedContentSpanish = contentSpanish;
@@ -1217,7 +1351,7 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
       [
         titleEnglish, titleSpanish, subtitleEnglish || null, subtitleSpanish || null,
         processedContentEnglish, processedContentSpanish, author, author_gender, publicationDate, categoryId,
-        priority || null, article_status_id || 1, slugEn, slugEs, id
+        managedPriority, article_status_id || 1, slugEn, slugEs, id
       ]
     );
 
@@ -1343,7 +1477,7 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
       author_gender,
       date: publicationDate,
       categoryId: parseInt(categoryId),
-      priority: priority ? parseInt(priority) : null,
+      priority: managedPriority,
       article_status_id: parseInt(article_status_id) || 1,
       imageEnglishUrl,
       imageSpanishUrl,
@@ -1402,7 +1536,6 @@ router.delete('/article/:id', verifyToken, async (req, res) => {
         const deleteCommand = new DeleteObjectsCommand(deleteParams);
         await s3.send(deleteCommand);
 
-        logger.info(`Deleted ${images.length} images from S3 for article ${id}`);
       } catch (s3Error) {
         logger.error('Error deleting images from S3:', s3Error);
         // Continue with database deletion even if S3 deletion fails
@@ -1793,6 +1926,7 @@ router.get('/summary/articles', async (req, res) => {
         AND ${titleField} IS NOT NULL 
         AND ${titleField} != ''
         AND a.priority IS NULL
+        AND a.category_id != 5
       ORDER BY a.publication_date DESC
       LIMIT ? OFFSET ?
     `;
@@ -1830,7 +1964,6 @@ router.get('/summary/articles', async (req, res) => {
       totalPages: totalPages,
       hasNext: hasNext
     };
-    console.log("response:", response)
     res.json(response);
 
   } catch (error) {
