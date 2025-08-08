@@ -650,7 +650,7 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
   try {
     const {
       titleEnglish, titleSpanish, subtitleEnglish, subtitleSpanish,
-      contentEnglish, contentSpanish, author, date, categoryId,
+      contentEnglish, contentSpanish, author, author_gender, date, categoryId,
       article_status_id, priority, imageCaptionEnglish, imageCaptionSpanish
     } = req.body;
 
@@ -665,12 +665,12 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
     const [articleResult] = await mysqlConnection.promise().query(
       `INSERT INTO article (
         title_en, title_es, subtitle_en, subtitle_es, content_en, content_es,
-        author, publication_date, category_id, priority, article_status_id,
+        author, author_gender, publication_date, category_id, priority, article_status_id,
         slug_en, slug_es
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         titleEnglish, titleSpanish, subtitleEnglish || null, subtitleSpanish || null,
-        contentEnglish, contentSpanish, author, publicationDate, categoryId,
+        contentEnglish, contentSpanish, author, author_gender, publicationDate, categoryId,
         priority || null, article_status_id || 1, slugEn, slugEs
       ]
     );
@@ -749,6 +749,7 @@ router.post('/article', verifyToken, articleUpload, async (req, res) => {
       contentEnglish: contentEnglishWithUrls,
       contentSpanish: contentSpanishWithUrls,
       author,
+      author_gender,
       date: publicationDate,
       categoryId: parseInt(categoryId),
       priority: priority ? parseInt(priority) : null,
@@ -793,6 +794,7 @@ router.get('/article', async (req, res) => {
         a.content_en as contentEnglish,
         a.content_es as contentSpanish,
         a.author,
+        a.author_gender,
         DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') as date,
         a.category_id as categoryId,
         a.priority,
@@ -875,6 +877,7 @@ router.get('/article', async (req, res) => {
         contentEnglish: contentEnglishWithUrls,
         contentSpanish: contentSpanishWithUrls,
         author: article.author,
+        author_gender: article.author_gender,
         date: article.date,
         categoryId: article.categoryId,
         categoryNameEnglish: article.categoryNameEnglish,
@@ -986,6 +989,7 @@ router.get('/article/:id', async (req, res) => {
       contentEnglish: contentEnglishWithUrls,
       contentSpanish: contentSpanishWithUrls,
       author: article.author,
+      author_gender: article.author_gender,
       date: article.publication_date,
       categoryId: article.category_id,
       categoryName: article.categoryName,
@@ -1025,7 +1029,7 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
     const { id } = req.params;
     const {
       titleEnglish, titleSpanish, subtitleEnglish, subtitleSpanish,
-      contentEnglish, contentSpanish, author, date, categoryId,
+      contentEnglish, contentSpanish, author, author_gender, date, categoryId,
       article_status_id, priority, imageCaptionEnglish, imageCaptionSpanish
     } = req.body;
 
@@ -1066,13 +1070,13 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
     await mysqlConnection.promise().query(
       `UPDATE article SET 
         title_en = ?, title_es = ?, subtitle_en = ?, subtitle_es = ?,
-        content_en = ?, content_es = ?, author = ?, publication_date = ?,
+        content_en = ?, content_es = ?, author = ?, author_gender = ?, publication_date = ?,
         category_id = ?, priority = ?, article_status_id = ?,
         slug_en = ?, slug_es = ?, modification_date = CURRENT_TIMESTAMP
       WHERE id = ?`,
       [
         titleEnglish, titleSpanish, subtitleEnglish || null, subtitleSpanish || null,
-        processedContentEnglish, processedContentSpanish, author, publicationDate, categoryId,
+        processedContentEnglish, processedContentSpanish, author, author_gender, publicationDate, categoryId,
         priority || null, article_status_id || 1, slugEn, slugEs, id
       ]
     );
@@ -1196,6 +1200,7 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
       contentEnglish: contentEnglishWithUrls,
       contentSpanish: contentSpanishWithUrls,
       author,
+      author_gender,
       date: publicationDate,
       categoryId: parseInt(categoryId),
       priority: priority ? parseInt(priority) : null,
