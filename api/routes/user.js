@@ -924,6 +924,7 @@ router.get('/article/:id', async (req, res) => {
     const [articles] = await mysqlConnection.promise().query(
       `SELECT 
         a.*,
+        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') as date,
         c.name_${lang === 'en' ? 'en' : 'es'} as categoryName,
         asi.name_${lang === 'en' ? 'en' : 'es'} as statusName
       FROM article a
@@ -990,7 +991,7 @@ router.get('/article/:id', async (req, res) => {
       contentSpanish: contentSpanishWithUrls,
       author: article.author,
       author_gender: article.author_gender,
-      date: article.publication_date,
+      date: article.date,
       categoryId: article.category_id,
       categoryName: article.categoryName,
       priority: article.priority,
@@ -1014,6 +1015,145 @@ router.get('/article/:id', async (req, res) => {
     console.error('Error fetching article:', error);
     logger.error('Error fetching article:', error);
     res.status(500).json('Internal server error');
+  }
+});
+
+// Get article by slug
+router.get('/article/slug/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    let matchedLanguage = null;
+    let article = null;
+
+    // First, try to find by English slug
+    const [englishArticles] = await mysqlConnection.promise().query(
+      `SELECT 
+        a.*,
+        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') as date,
+        c.name_en as categoryNameEn,
+        c.name_es as categoryNameEs,
+        asi.name_en as statusNameEn,
+        asi.name_es as statusNameEs
+      FROM article a
+      LEFT JOIN category c ON a.category_id = c.id
+      LEFT JOIN article_status asi ON a.article_status_id = asi.id
+      WHERE a.slug_en = ?`,
+      [slug]
+    );
+
+    if (englishArticles.length > 0) {
+      article = englishArticles[0];
+      matchedLanguage = 'en';
+    } else {
+      // If not found by English slug, try Spanish slug
+      const [spanishArticles] = await mysqlConnection.promise().query(
+        `SELECT 
+          a.*,
+          DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%m/%d/%Y %T') as date,
+          c.name_en as categoryNameEn,
+          c.name_es as categoryNameEs,
+          asi.name_en as statusNameEn,
+          asi.name_es as statusNameEs
+        FROM article a
+        LEFT JOIN category c ON a.category_id = c.id
+        LEFT JOIN article_status asi ON a.article_status_id = asi.id
+        WHERE a.slug_es = ?`,
+        [slug]
+      );
+
+      if (spanishArticles.length > 0) {
+        article = spanishArticles[0];
+        matchedLanguage = 'es';
+      }
+    }
+
+    // If no article found with either slug, return 404
+    if (!article) {
+      return res.status(404).json({ message: 'Article not found' });
+    }
+
+    // Get article images
+    const [images] = await mysqlConnection.promise().query(
+      `SELECT 
+        image_type,
+        s3_key,
+        alt_text_en,
+        alt_text_es,
+        caption_en,
+        caption_es
+      FROM article_images 
+      WHERE article_id = ?
+      ORDER BY image_type, display_order`,
+      [article.id]
+    );
+
+    // Format images with signed URLs
+    let imageEnglishUrl = null;
+    let imageSpanishUrl = null;
+    let imageCaptionEnglish = null;
+    let imageCaptionSpanish = null;
+
+    for (const img of images) {
+      if (img.image_type === 'preview_en') {
+        imageEnglishUrl = await getSignedUrlForImage(img.s3_key);
+        imageCaptionEnglish = img.caption_en;
+      } else if (img.image_type === 'preview_es') {
+        imageSpanishUrl = await getSignedUrlForImage(img.s3_key);
+        imageCaptionSpanish = img.caption_es;
+      }
+    }
+
+    // Replace S3 key placeholders with signed URLs in content
+    const contentEnglishWithUrls = await replaceS3KeysWithSignedUrls(article.content_en);
+    const contentSpanishWithUrls = await replaceS3KeysWithSignedUrls(article.content_es);
+
+    // Update view count
+    await mysqlConnection.promise().query(
+      'UPDATE article SET view_count = view_count + 1 WHERE id = ?',
+      [article.id]
+    );
+
+    const articleResponse = {
+      id: article.id,
+      titleEnglish: article.title_en,
+      titleSpanish: article.title_es,
+      subtitleEnglish: article.subtitle_en,
+      subtitleSpanish: article.subtitle_es,
+      contentEnglish: contentEnglishWithUrls,
+      contentSpanish: contentSpanishWithUrls,
+      author: article.author,
+      author_gender: article.author_gender,
+      date: article.date,
+      categoryId: article.category_id,
+      categoryNameEnglish: article.categoryNameEn,
+      categoryNameSpanish: article.categoryNameEs,
+      priority: article.priority,
+      article_status_id: article.article_status_id,
+      statusNameEnglish: article.statusNameEn,
+      statusNameSpanish: article.statusNameEs,
+      slugEnglish: article.slug_en,
+      slugSpanish: article.slug_es,
+      viewCount: article.view_count + 1,
+      featured: article.featured,
+      imageEnglishUrl,
+      imageSpanishUrl,
+      imageCaptionEnglish,
+      imageCaptionSpanish,
+      createdAt: article.creation_date,
+      updatedAt: article.modification_date
+    };
+
+    const response = {
+      article: articleResponse,
+      matchedLanguage
+    };
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('Error fetching article by slug:', error);
+    logger.error('Error fetching article by slug:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 
