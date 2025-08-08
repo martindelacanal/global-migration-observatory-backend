@@ -1621,6 +1621,58 @@ router.post('/article/batch-process-content-images', verifyToken, async (req, re
 
 // ================= END ARTICLE ENDPOINTS =================
 
+// ================= SUMMARY ENDPOINTS =================
+
+// Get opinion articles summary
+router.get('/summary/opinion', async (req, res) => {
+  try {
+    const { language = 'en' } = req.query;
+
+    // Validate language parameter
+    if (!['en', 'es'].includes(language)) {
+      return res.status(400).json('Invalid language parameter. Must be "en" or "es"');
+    }
+
+    // Query opinion articles (category_id = 5) with basic info
+    const titleField = language === 'en' ? 'title_en' : 'title_es';
+    const subtitleField = language === 'en' ? 'subtitle_en' : 'subtitle_es';
+
+    const query = `
+      SELECT 
+        ${titleField} as title,
+        ${subtitleField} as subtitle,
+        author,
+        author_gender
+      FROM article 
+      WHERE category_id = 5 
+        AND article_status_id = 2
+        AND ${titleField} IS NOT NULL 
+        AND ${titleField} != ''
+      ORDER BY publication_date DESC, creation_date DESC
+      LIMIT 10
+    `;
+
+    const [articles] = await mysqlConnection.promise().query(query);
+
+    // Format response to match the frontend interface
+    const formattedArticles = articles.map(article => ({
+      title: article.title,
+      subtitle: article.subtitle || '',
+      author: article.author,
+      author_gender: article.author_gender
+    }));
+
+    res.json(formattedArticles);
+
+  } catch (error) {
+    console.error('Error fetching opinion articles summary:', error);
+    logger.error('Error fetching opinion articles summary:', error);
+    res.status(500).json('Internal server error');
+  }
+});
+
+// ================= END SUMMARY ENDPOINTS =================
+
 function verifyToken(req, res, next) {
 
   if (!req.headers.authorization) return res.status(401).json('No autorizado');
