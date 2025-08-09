@@ -1941,9 +1941,13 @@ router.get('/summary/articles', async (req, res) => {
       WHERE a.article_status_id = 2
         AND ${titleField} IS NOT NULL 
         AND ${titleField} != ''
-        AND a.priority IS NULL`;
+        `;
 
     let queryParams = [imageType];
+
+    if (!categoryId) {
+      query += ' AND a.priority IS NULL';
+    }
 
     if (categoryId) {
       query += ' AND a.category_id = ?';
