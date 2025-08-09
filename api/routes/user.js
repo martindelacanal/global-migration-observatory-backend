@@ -1875,7 +1875,7 @@ router.get('/summary/priority', async (req, res) => {
 // Get paginated articles summary
 router.get('/summary/articles', async (req, res) => {
   try {
-    const { language = 'en', page = 1, limit = 10 } = req.query;
+    const { language = 'en', page = 1, limit = 10, category } = req.query;
 
     // Validate language parameter
     if (!['en', 'es'].includes(language)) {
@@ -1894,16 +1894,31 @@ router.get('/summary/articles', async (req, res) => {
       return res.status(400).json('Invalid limit parameter. Must be between 1 and 100');
     }
 
+    // Validate category parameter if provided
+    const categoryId = category ? parseInt(category) : null;
+    if (category && (isNaN(categoryId) || categoryId < 1)) {
+      return res.status(400).json('Invalid category parameter');
+    }
+
     const offset = (pageNumber - 1) * limitNumber;
 
-    // Get total count for pagination
-    const [countResult] = await mysqlConnection.promise().query(
-      `SELECT COUNT(*) as total 
+    // Build count query with optional category filter
+    let countQuery = `SELECT COUNT(*) as total 
        FROM article 
        WHERE article_status_id = 2 
          AND (title_en IS NOT NULL AND title_en != '') 
-         AND (title_es IS NOT NULL AND title_es != '')`
-    );
+         AND (title_es IS NOT NULL AND title_es != '')`;
+    let countParams = [];
+
+    if (categoryId) {
+      countQuery += ' AND category_id = ?';
+      countParams.push(categoryId);
+    } else {
+      countQuery += ' AND category_id != 5';
+    }
+
+    // Get total count for pagination
+    const [countResult] = await mysqlConnection.promise().query(countQuery, countParams);
     const totalCount = countResult[0].total;
 
     // Query articles with pagination and preview images
@@ -1912,7 +1927,8 @@ router.get('/summary/articles', async (req, res) => {
     const slugField = language === 'en' ? 'slug_en' : 'slug_es';
     const imageType = language === 'en' ? 'preview_en' : 'preview_es';
 
-    const query = `
+    // Build main query with optional category filter
+    let query = `
       SELECT 
         ${titleField} as title,
         ${subtitleField} as subtitle,
@@ -1925,13 +1941,21 @@ router.get('/summary/articles', async (req, res) => {
       WHERE a.article_status_id = 2
         AND ${titleField} IS NOT NULL 
         AND ${titleField} != ''
-        AND a.priority IS NULL
-        AND a.category_id != 5
-      ORDER BY a.publication_date DESC
-      LIMIT ? OFFSET ?
-    `;
+        AND a.priority IS NULL`;
 
-    const [articles] = await mysqlConnection.promise().query(query, [imageType, limitNumber, offset]);
+    let queryParams = [imageType];
+
+    if (categoryId) {
+      query += ' AND a.category_id = ?';
+      queryParams.push(categoryId);
+    } else {
+      query += ' AND a.category_id != 5';
+    }
+
+    query += ' ORDER BY a.publication_date DESC LIMIT ? OFFSET ?';
+    queryParams.push(limitNumber, offset);
+
+    const [articles] = await mysqlConnection.promise().query(query, queryParams);
 
     // Format response with signed URLs for images
     const formattedArticles = await Promise.all(articles.map(async (article) => {
