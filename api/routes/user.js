@@ -1933,7 +1933,7 @@ router.get('/summary/articles', async (req, res) => {
         ${titleField} as title,
         ${subtitleField} as subtitle,
         ${slugField} as slug,
-        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%Y-%m-%d') as publication_date,
+        DATE_FORMAT(CONVERT_TZ(a.publication_date, '+00:00', 'America/Los_Angeles'), '%Y-%m-%d %T') as publication_date,
         a.author,
         ai.s3_key as image_s3_key
       FROM article a
