@@ -11,14 +11,20 @@ const mysql = require('mysql2');
 // });
 
 const mysqlConnection = mysql.createPool({
-  connectionLimit : 1000,
+  connectionLimit: 1000,
+  queueLimit: 0,
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
   port: process.env.DB_PORT,
   multipleStatements: true,
-  decimalNumbers: true
+  // Optimization settings
+  supportBigNumbers: true,
+  bigNumberStrings: true,
+  dateStrings: true,
+  charset: 'utf8mb4',
+  timezone: '+00:00'
 });
 
 // mysqlConnection.connect( err => {
