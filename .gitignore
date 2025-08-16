@@ -5,6 +5,8 @@
 /api/public/uploads/*
 .env
 /logs/*
+# ChromaDB local database
+chroma_db/
 
 # compiled output
 /dist
