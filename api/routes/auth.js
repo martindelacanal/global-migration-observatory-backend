@@ -79,7 +79,7 @@ router.post('/signin', (req, res) => {
 router.get('/refresh-token', verifyToken, (req, res) => {
   const cabecera = JSON.parse(req.data.data);
 
-  if (cabecera.role === 'admin' || cabecera.role === 'client' || cabecera.role === 'stocker' || cabecera.role === 'delivery' || cabecera.role === 'beneficiary' || cabecera.role === 'opsmanager' || cabecera.role === 'director' || cabecera.role === 'auditor') {
+  if (cabecera.role === 'admin' && cabecera.role !== 'content_manager') {
     jwt.sign({ data: req.data.data }, process.env.JWT_SECRET, { expiresIn: '1h' }, (err, token) => {
       res.status(200).json({ token: token });
     });

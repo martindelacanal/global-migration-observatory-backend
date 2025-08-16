@@ -4,7 +4,7 @@ const { verifyToken, mysqlConnection } = require('../utils/sharedHelpers');
 
 router.get('/categories', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
-  if (cabecera.role === 'admin') {
+  if (cabecera.role === 'admin' && cabecera.role !== 'content_manager') {
     try {
       const { lang = 'en' } = req.query; // Idioma por defecto: inglés
 
@@ -35,7 +35,7 @@ router.get('/categories', verifyToken, async (req, res) => {
 
 router.get('/article/status', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
-  if (cabecera.role === 'admin') {
+  if (cabecera.role === 'admin' && cabecera.role !== 'content_manager') {
     try {
       const { lang = 'en' } = req.query;
 

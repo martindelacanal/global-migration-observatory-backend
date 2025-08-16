@@ -383,7 +383,7 @@ async function uploadArticleImage(file, articleId, imageType, altTextEn = '', al
 router.post('/article', verifyToken, articleUpload, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 
@@ -954,7 +954,7 @@ router.get('/article/slug/:slug', async (req, res) => {
 router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 
@@ -1127,7 +1127,7 @@ router.put('/article/:id', verifyToken, articleUpload, async (req, res) => {
 router.delete('/article/:id', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 
@@ -1192,7 +1192,7 @@ router.delete('/article/:id', verifyToken, async (req, res) => {
 router.post('/article/upload-image', verifyToken, articleUpload, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 
@@ -1231,7 +1231,7 @@ router.post('/article/upload-image', verifyToken, articleUpload, async (req, res
 router.post('/article/:id/process-content-images', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 
@@ -1298,7 +1298,7 @@ router.post('/article/:id/process-content-images', verifyToken, async (req, res)
 router.post('/article/batch-process-content-images', verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   
-  if (cabecera.role !== 'admin') {
+  if (cabecera.role !== 'admin' && cabecera.role !== 'content_manager') {
     return res.status(401).json('Unauthorized');
   }
 

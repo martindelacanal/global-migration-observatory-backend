@@ -7,6 +7,7 @@ const categoriesRoutes = require('./categories');
 const articlesRoutes = require('./articles');
 const summaryRoutes = require('./summary');
 const userConfigurationRoutes = require('./userConfiguration');
+const chatbotRoutes = require('./chatbot');
 
 // Use modular routes
 router.use('/', authRoutes);
@@ -14,6 +15,7 @@ router.use('/', categoriesRoutes);
 router.use('/', articlesRoutes);
 router.use('/', summaryRoutes);
 router.use('/', userConfigurationRoutes);
+router.use('/', chatbotRoutes);
 
 router.get('/ping', (req, res) => {
   res.status(200).send();
