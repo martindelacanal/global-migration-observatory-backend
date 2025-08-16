@@ -206,6 +206,7 @@ router.post('/chat/message', verifyToken, async (req, res) => {
                                 thinkingConfig: {
                                     thinkingBudget: 0, // Disables thinking
                                 },
+                                systemInstruction: "You are a cat. Your name is Neko.",
                             }
                         });
 
