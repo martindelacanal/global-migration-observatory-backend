@@ -198,63 +198,85 @@ router.post('/chat/message', verifyToken, async (req, res) => {
                         // Agregar mensaje actual
                         conversationContext += `Usuario: ${message}\nAsistente:`;
 
-                        // Llamar a Gemini
-                        const response = await ai.models.generateContent({
-                            model: "gemini-2.5-flash",
-                            contents: conversationContext,
-                            config: {
-                                thinkingConfig: {
-                                    thinkingBudget: 0, // Disables thinking
-                                },
-                                systemInstruction: "You are a cat. Your name is Neko.",
-                            }
-                        });
-
-                        const aiResponse = response.text;
-
-                        // Guardar respuesta de la IA
-                        const aiMessageQuery = 'INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)';
-
-                        mysqlConnection.query(aiMessageQuery, [sessionId, 'assistant', aiResponse], (err, aiMessageResult) => {
+                        // Obtener el prompt personalizado de la base de datos
+                        const promptQuery = 'SELECT prompt FROM chat_prompt ORDER BY modification_date DESC LIMIT 1';
+                        
+                        mysqlConnection.query(promptQuery, [], async (err, promptResults) => {
                             if (err) {
-                                console.error('Error saving AI message:', err);
-                                return res.status(500).json({
+                                console.error('Error getting chat prompt:', err);
+                                // Si hay error, usar prompt por defecto
+                            }
+                            
+                            const systemInstruction = promptResults && promptResults.length > 0 && promptResults[0].prompt
+                                ? promptResults[0].prompt
+                                : "Eres un asistente útil especializado en migración global. Proporciona información precisa y actualizada sobre temas relacionados con migración, políticas migratorias, estadísticas demográficas y tendencias globales.";
+
+                            try {
+                                // Llamar a Gemini
+                                const response = await ai.models.generateContent({
+                                    model: "gemini-2.5-flash",
+                                    contents: conversationContext,
+                                    config: {
+                                        thinkingConfig: {
+                                            thinkingBudget: 0, // Disables thinking
+                                        },
+                                        systemInstruction: systemInstruction,
+                                    }
+                                });
+
+                                const aiResponse = response.text;
+
+                                // Guardar respuesta de la IA
+                                const aiMessageQuery = 'INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)';
+
+                                mysqlConnection.query(aiMessageQuery, [sessionId, 'assistant', aiResponse], (err, aiMessageResult) => {
+                                    if (err) {
+                                        console.error('Error saving AI message:', err);
+                                        return res.status(500).json({
+                                            success: false,
+                                            message: 'Error al guardar la respuesta de la IA'
+                                        });
+                                    }
+
+                                    // Actualizar timestamp de la sesión
+                                    const updateSessionQuery = 'UPDATE chat_sessions SET modification_date = CURRENT_TIMESTAMP WHERE id = ?';
+                                    mysqlConnection.query(updateSessionQuery, [sessionId], (err) => {
+                                        if (err) {
+                                            console.error('Error updating session timestamp:', err);
+                                        }
+                                    });
+
+                                    res.json({
+                                        success: true,
+                                        userMessage: {
+                                            id: userMessageResult.insertId,
+                                            role: 'user',
+                                            content: message,
+                                            creation_date: new Date()
+                                        },
+                                        aiResponse: {
+                                            id: aiMessageResult.insertId,
+                                            role: 'assistant',
+                                            content: aiResponse,
+                                            creation_date: new Date()
+                                        }
+                                    });
+                                });
+                            } catch (aiError) {
+                                console.error('Error calling Gemini AI:', aiError);
+                                res.status(500).json({
                                     success: false,
-                                    message: 'Error al guardar la respuesta de la IA'
+                                    message: 'Error al obtener respuesta de la IA'
                                 });
                             }
-
-                            // Actualizar timestamp de la sesión
-                            const updateSessionQuery = 'UPDATE chat_sessions SET modification_date = CURRENT_TIMESTAMP WHERE id = ?';
-                            mysqlConnection.query(updateSessionQuery, [sessionId], (err) => {
-                                if (err) {
-                                    console.error('Error updating session timestamp:', err);
-                                }
-                            });
-
-                            res.json({
-                                success: true,
-                                userMessage: {
-                                    id: userMessageResult.insertId,
-                                    role: 'user',
-                                    content: message,
-                                    creation_date: new Date()
-                                },
-                                aiResponse: {
-                                    id: aiMessageResult.insertId,
-                                    role: 'assistant',
-                                    content: aiResponse,
-                                    creation_date: new Date()
-                                }
-                            });
                         });
                     });
-
-                } catch (aiError) {
-                    console.error('Error calling Gemini AI:', aiError);
+                    
+                } catch (innerError) {
+                    console.error('Error in inner try block:', innerError);
                     res.status(500).json({
                         success: false,
-                        message: 'Error al obtener respuesta de la IA'
+                        message: 'Error al procesar el mensaje'
                     });
                 }
             });
@@ -356,6 +378,111 @@ router.patch('/chat/sessions/:sessionId', verifyToken, (req, res) => {
             success: true,
             message: 'Título actualizado exitosamente'
         });
+    });
+});
+
+// GET - Obtener el prompt actual del chatbot (solo admin)
+router.get('/chat/prompt', verifyToken, (req, res) => {
+    const cabecera = JSON.parse(req.data.data);
+
+    if (cabecera.role !== 'admin') {
+        return res.status(401).json('Unauthorized');
+    }
+
+    const query = 'SELECT * FROM chat_prompt ORDER BY modification_date DESC LIMIT 1';
+
+    mysqlConnection.query(query, [], (err, results) => {
+        if (err) {
+            console.error('Error getting chat prompt:', err);
+            return res.status(500).json({
+                success: false,
+                message: 'Error al obtener el prompt del chatbot'
+            });
+        }
+
+        if (results.length === 0) {
+            return res.json({
+                success: true,
+                prompt: null,
+                message: 'No hay prompt configurado'
+            });
+        }
+
+        res.json({
+            success: true,
+            prompt: results[0]
+        });
+    });
+});
+
+// POST - Crear o actualizar el prompt del chatbot (solo admin)
+router.post('/chat/prompt', verifyToken, (req, res) => {
+    const cabecera = JSON.parse(req.data.data);
+
+    if (cabecera.role !== 'admin') {
+        return res.status(401).json('Unauthorized');
+    }
+
+    const { prompt } = req.body;
+
+    if (!prompt || prompt.trim() === '') {
+        return res.status(400).json({
+            success: false,
+            message: 'El prompt es requerido y no puede estar vacío'
+        });
+    }
+
+    // Primero verificar si existe un prompt
+    const checkQuery = 'SELECT id FROM chat_prompt ORDER BY modification_date DESC LIMIT 1';
+
+    mysqlConnection.query(checkQuery, [], (err, checkResults) => {
+        if (err) {
+            console.error('Error checking existing prompt:', err);
+            return res.status(500).json({
+                success: false,
+                message: 'Error al verificar el prompt existente'
+            });
+        }
+
+        if (checkResults.length > 0) {
+            // Actualizar el prompt existente
+            const updateQuery = 'UPDATE chat_prompt SET prompt = ?, modification_date = CURRENT_TIMESTAMP WHERE id = ?';
+            
+            mysqlConnection.query(updateQuery, [prompt.trim(), checkResults[0].id], (err, updateResult) => {
+                if (err) {
+                    console.error('Error updating chat prompt:', err);
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Error al actualizar el prompt del chatbot'
+                    });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Prompt del chatbot actualizado exitosamente',
+                    promptId: checkResults[0].id
+                });
+            });
+        } else {
+            // Crear nuevo prompt
+            const insertQuery = 'INSERT INTO chat_prompt (prompt) VALUES (?)';
+            
+            mysqlConnection.query(insertQuery, [prompt.trim()], (err, insertResult) => {
+                if (err) {
+                    console.error('Error creating chat prompt:', err);
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Error al crear el prompt del chatbot'
+                    });
+                }
+
+                res.json({
+                    success: true,
+                    message: 'Prompt del chatbot creado exitosamente',
+                    promptId: insertResult.insertId
+                });
+            });
+        }
     });
 });
 
