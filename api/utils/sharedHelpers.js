@@ -125,6 +125,7 @@ module.exports = {
   verifyToken,
   getSignedUrlForImage,
   getSignedUrlsForImages,
+  getSignedUrl,
   s3,
   bucketName,
   randomImageName,
