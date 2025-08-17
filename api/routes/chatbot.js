@@ -1,9 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const multer = require('multer');
-const { ChromaClient } = require('chromadb');
 const pdf = require('pdf-parse');
+const fs = require('fs');
+const path = require('path');
 const {
     verifyToken,
     mysqlConnection,
@@ -19,7 +20,7 @@ const {
 
 // Configuración de multer para archivos PDF
 const storage = multer.memoryStorage();
-const pdfUpload = multer({ 
+const pdfUpload = multer({
     storage: storage,
     fileFilter: (req, file, cb) => {
         // Solo permitir archivos PDF
@@ -44,18 +45,277 @@ function generatePdfFileName() {
     return randomImageName(); // Reutilizamos la función existente
 }
 
-// Configuración de ChromaDB embebido
-const chromaClient = new ChromaClient();
-
+// Configuración de base de datos vectorial simple
+const VECTOR_DB_PATH = './vector_data';
 const COLLECTION_NAME = 'migration_documents';
+
+// Asegurar que el directorio existe
+if (!fs.existsSync(VECTOR_DB_PATH)) {
+    fs.mkdirSync(VECTOR_DB_PATH, { recursive: true });
+}
+
+// Inicializar Gemini AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Función de embedding usando Gemini
+class GeminiEmbeddingFunction {
+    constructor() {
+        // El modelo 'embedding-001' es el estándar para esta tarea.
+        this.model = genAI.getGenerativeModel({ model: "embedding-001" });
+        this.batchSize = 100; // Límite de la API de Gemini es 100
+    }
+
+    async embed(texts) {
+        try {
+            const allEmbeddings = [];
+            // Procesar los textos en lotes para no exceder el límite de la API
+            for (let i = 0; i < texts.length; i += this.batchSize) {
+                const batchTexts = texts.slice(i, i + this.batchSize);
+
+                const result = await this.model.batchEmbedContents({
+                    requests: batchTexts.map(text => ({
+                        content: { parts: [{ text }] },
+                    })),
+                });
+
+                const batchEmbeddings = result.embeddings.map(e => e.values);
+                allEmbeddings.push(...batchEmbeddings);
+            }
+            return allEmbeddings;
+        } catch (error) {
+            console.error('Error generating embeddings with Gemini:', error);
+            // Lanza el error para que el proceso que lo llamó pueda manejarlo.
+            throw new Error('Failed to generate embeddings.');
+        }
+    }
+}
+
+// Función de embedding simple usando hash para evitar dependencias externas
+class SimpleEmbeddingFunction {
+    constructor() {
+        this.dimension = 384; // Dimensión estándar para embeddings
+    }
+
+    async embed(texts) {
+        // Crear embeddings simples basados en características del texto
+        return texts.map(text => {
+            const normalized = text.toLowerCase().replace(/[^\w\s]/g, '');
+            const words = normalized.split(/\s+/).filter(w => w.length > 0);
+
+            // Crear un vector de características basado en el texto
+            const embedding = new Array(this.dimension).fill(0);
+
+            // Llenar el embedding con características del texto
+            for (let i = 0; i < words.length && i < this.dimension; i++) {
+                const word = words[i];
+                const hash = this.simpleHash(word);
+                embedding[i % this.dimension] += hash / (words.length + 1);
+            }
+
+            // Normalizar el vector
+            const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+            if (magnitude > 0) {
+                for (let i = 0; i < embedding.length; i++) {
+                    embedding[i] /= magnitude;
+                }
+            }
+
+            return embedding;
+        });
+    }
+
+    simpleHash(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash) / 2147483647; // Normalize to 0-1
+    }
+}
+
+// Clase para manejar la base de datos vectorial simple
+class SimpleVectorDB {
+    constructor() {
+        this.embeddingFunction = new GeminiEmbeddingFunction();
+        this.collectionPath = path.join(VECTOR_DB_PATH, `${COLLECTION_NAME}.json`);
+        this.collection = this.loadCollection();
+    }
+
+    loadCollection() {
+        try {
+            if (fs.existsSync(this.collectionPath)) {
+                const data = fs.readFileSync(this.collectionPath, 'utf8');
+                return JSON.parse(data);
+            }
+        } catch (error) {
+            console.error('Error loading collection:', error);
+        }
+        return {
+            name: COLLECTION_NAME,
+            documents: [],
+            metadata: { created_at: new Date().toISOString() }
+        };
+    }
+
+    saveCollection() {
+        try {
+            fs.writeFileSync(this.collectionPath, JSON.stringify(this.collection, null, 2));
+        } catch (error) {
+            console.error('Error saving collection:', error);
+            throw error;
+        }
+    }
+
+    async add({ ids, documents, metadatas }) {
+        try {
+            const embeddings = await this.embeddingFunction.embed(documents);
+
+            for (let i = 0; i < ids.length; i++) {
+                // Verificar si el documento ya existe
+                const existingIndex = this.collection.documents.findIndex(doc => doc.id === ids[i]);
+
+                const documentData = {
+                    id: ids[i],
+                    document: documents[i],
+                    metadata: metadatas[i],
+                    embedding: embeddings[i],
+                    created_at: new Date().toISOString()
+                };
+
+                if (existingIndex >= 0) {
+                    // Actualizar documento existente
+                    this.collection.documents[existingIndex] = documentData;
+                } else {
+                    // Agregar nuevo documento
+                    this.collection.documents.push(documentData);
+                }
+            }
+
+            this.saveCollection();
+        } catch (error) {
+            console.error('Error adding documents:', error);
+            throw error;
+        }
+    }
+
+    async query({ queryTexts, nResults = 5, include = ['documents', 'metadatas', 'distances'] }) {
+        try {
+            if (this.collection.documents.length === 0) {
+                return {
+                    documents: [[]],
+                    metadatas: [[]],
+                    distances: [[]]
+                };
+            }
+
+            const queryEmbeddings = await this.embeddingFunction.embed(queryTexts);
+            const queryEmbedding = queryEmbeddings[0];
+
+            // Calcular similitudes coseno
+            const similarities = this.collection.documents.map(doc => {
+                const similarity = this.cosineSimilarity(queryEmbedding, doc.embedding);
+                return {
+                    ...doc,
+                    similarity: similarity,
+                    distance: 1 - similarity // Convertir similitud a distancia
+                };
+            });
+
+            // Ordenar por similitud (mayor a menor)
+            similarities.sort((a, b) => b.similarity - a.similarity);
+
+            // Tomar los mejores resultados
+            const topResults = similarities.slice(0, nResults);
+
+            const result = {
+                documents: [[]],
+                metadatas: [[]],
+                distances: [[]]
+            };
+
+            if (include.includes('documents')) {
+                result.documents[0] = topResults.map(r => r.document);
+            }
+            if (include.includes('metadatas')) {
+                result.metadatas[0] = topResults.map(r => r.metadata);
+            }
+            if (include.includes('distances')) {
+                result.distances[0] = topResults.map(r => r.distance);
+            }
+
+            return result;
+        } catch (error) {
+            console.error('Error querying documents:', error);
+            throw error;
+        }
+    }
+
+    async get({ where }) {
+        try {
+            let filteredDocs = this.collection.documents;
+
+            if (where) {
+                filteredDocs = this.collection.documents.filter(doc => {
+                    return Object.keys(where).every(key => {
+                        return doc.metadata[key] === where[key];
+                    });
+                });
+            }
+
+            return {
+                ids: filteredDocs.map(doc => doc.id),
+                documents: filteredDocs.map(doc => doc.document),
+                metadatas: filteredDocs.map(doc => doc.metadata)
+            };
+        } catch (error) {
+            console.error('Error getting documents:', error);
+            throw error;
+        }
+    }
+
+    async delete({ where }) {
+        try {
+            const initialCount = this.collection.documents.length;
+
+            if (where) {
+                this.collection.documents = this.collection.documents.filter(doc => {
+                    return !Object.keys(where).every(key => {
+                        return doc.metadata[key] === where[key];
+                    });
+                });
+            }
+
+            this.saveCollection();
+            const deletedCount = initialCount - this.collection.documents.length;
+            return deletedCount;
+        } catch (error) {
+            console.error('Error deleting documents:', error);
+            throw error;
+        }
+    }
+
+    cosineSimilarity(vecA, vecB) {
+        const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+        const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+        const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+
+        if (magnitudeA === 0 || magnitudeB === 0) return 0;
+        return dotProduct / (magnitudeA * magnitudeB);
+    }
+}
+
+// Instancia global de la base de datos vectorial
+const vectorDB = new SimpleVectorDB();
 
 // Función para dividir texto en fragmentos (chunks)
 function chunkText(text, chunkSize = 1000, overlap = 200) {
     const chunks = [];
     const sentences = text.split(/[.!?]+/).filter(sentence => sentence.trim().length > 0);
-    
+
     let currentChunk = '';
-    
+
     for (const sentence of sentences) {
         if ((currentChunk + sentence).length <= chunkSize) {
             currentChunk += sentence + '. ';
@@ -66,26 +326,21 @@ function chunkText(text, chunkSize = 1000, overlap = 200) {
             currentChunk = sentence + '. ';
         }
     }
-    
+
     if (currentChunk.trim()) {
         chunks.push(currentChunk.trim());
     }
-    
+
     return chunks.filter(chunk => chunk.length > 50); // Filtrar chunks muy pequeños
 }
 
-// Función para obtener la colección de ChromaDB
+// Función para obtener la colección de la base de datos vectorial
 async function getOrCreateCollection() {
     try {
-        return await chromaClient.getOrCreateCollection({
-            name: COLLECTION_NAME,
-            metadata: { 
-                description: "Migration research documents collection",
-                created_at: new Date().toISOString()
-            }
-        });
+        // Simplemente retornamos la instancia de vectorDB
+        return vectorDB;
     } catch (error) {
-        console.error('Error getting/creating ChromaDB collection:', error);
+        console.error('Error getting/creating vector collection:', error);
         throw error;
     }
 }
@@ -93,42 +348,40 @@ async function getOrCreateCollection() {
 // Función para indexar un documento PDF
 async function indexPdfDocument(s3Key, originalFilename, documentId) {
     try {
-        console.log(`Iniciando indexación de documento: ${originalFilename}`);
-        
         // Descargar el PDF desde S3
         const command = new GetObjectCommand({
             Bucket: bucketName,
             Key: s3Key
         });
-        
+
         const response = await s3.send(command);
         const chunks = [];
-        
+
         for await (const chunk of response.Body) {
             chunks.push(chunk);
         }
-        
+
         const buffer = Buffer.concat(chunks);
-        
+
         // Extraer texto del PDF
         const pdfData = await pdf(buffer);
         const text = pdfData.text.replace(/\s+/g, ' ').trim();
-        
+
         if (!text || text.length < 100) {
             throw new Error('No se pudo extraer texto suficiente del PDF');
         }
-        
+
         // Dividir en fragmentos
         const textChunks = chunkText(text);
-        
+
         if (textChunks.length === 0) {
             throw new Error('No se pudieron crear fragmentos de texto válidos');
         }
-        
+
         // Obtener la colección
         const collection = await getOrCreateCollection();
-        
-        // Preparar datos para ChromaDB
+
+        // Preparar datos para la base de datos vectorial
         const ids = textChunks.map((_, index) => `${s3Key}-chunk-${index}`);
         const metadatas = textChunks.map((chunk, index) => ({
             source_s3_key: s3Key,
@@ -138,46 +391,44 @@ async function indexPdfDocument(s3Key, originalFilename, documentId) {
             chunk_length: chunk.length,
             indexed_at: new Date().toISOString()
         }));
-        
-        // Agregar documentos a ChromaDB
+
+        // Agregar documentos a la base de datos vectorial
         await collection.add({
             ids: ids,
             documents: textChunks,
             metadatas: metadatas
         });
-        
-        console.log(`Documento ${originalFilename} indexado exitosamente. ${textChunks.length} fragmentos creados.`);
+
         return textChunks.length;
-        
+
     } catch (error) {
         console.error(`Error indexando documento ${originalFilename}:`, error);
         throw error;
     }
 }
 
-// Función para eliminar un documento de ChromaDB
+// Función para eliminar un documento de la base de datos vectorial
 async function removeDocumentFromIndex(s3Key) {
     try {
         const collection = await getOrCreateCollection();
-        
+
         // Obtener todos los fragmentos del documento
         const results = await collection.get({
             where: { source_s3_key: s3Key }
         });
-        
+
         if (results.ids.length > 0) {
             // Eliminar todos los fragmentos del documento
-            await collection.delete({
+            const deletedCount = await collection.delete({
                 where: { source_s3_key: s3Key }
             });
-            
-            console.log(`Eliminados ${results.ids.length} fragmentos del documento ${s3Key} de ChromaDB`);
-            return results.ids.length;
+
+            return deletedCount;
         }
-        
+
         return 0;
     } catch (error) {
-        console.error(`Error eliminando documento ${s3Key} de ChromaDB:`, error);
+        console.error(`Error eliminando documento ${s3Key} de la base de datos vectorial:`, error);
         throw error;
     }
 }
@@ -186,13 +437,13 @@ async function removeDocumentFromIndex(s3Key) {
 async function searchRelevantDocuments(query, nResults = 5) {
     try {
         const collection = await getOrCreateCollection();
-        
+
         const results = await collection.query({
             queryTexts: [query],
             nResults: nResults,
             include: ['documents', 'metadatas', 'distances']
         });
-        
+
         return results;
     } catch (error) {
         console.error('Error buscando documentos relevantes:', error);
@@ -201,10 +452,6 @@ async function searchRelevantDocuments(query, nResults = 5) {
 }
 
 
-// Inicializar Gemini AI
-const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY
-});
 
 // GET - Obtener todas las sesiones de chat de un usuario
 router.get('/chat/sessions', verifyToken, (req, res) => {
@@ -382,30 +629,32 @@ router.post('/chat/message', verifyToken, async (req, res) => {
 
                         try {
                             // ============ IMPLEMENTACIÓN RAG ============
-                            
-                            // 1. Buscar documentos relevantes en ChromaDB
+
+                            // 1. Buscar documentos relevantes en la base de datos vectorial
                             let relevantContext = '';
                             let documentsUsed = [];
-                            
+
                             try {
                                 const searchResults = await searchRelevantDocuments(message, 5);
-                                
+
                                 if (searchResults.documents && searchResults.documents[0] && searchResults.documents[0].length > 0) {
                                     // Construir contexto desde los documentos encontrados
                                     const documents = searchResults.documents[0];
                                     const metadatas = searchResults.metadatas[0];
                                     const distances = searchResults.distances[0];
-                                    
+
                                     for (let i = 0; i < documents.length; i++) {
-                                        if (distances[i] < 1.5) { // Filtrar por relevancia (ajustar según necesidad)
+
+                                        if (distances[i] < 1.2) { // Ajustado el umbral para ser menos restrictivo
                                             relevantContext += `\n--- Fragmento ${i + 1} (${metadatas[i].original_filename}) ---\n`;
                                             relevantContext += documents[i] + '\n';
-                                            
+
                                             if (!documentsUsed.includes(metadatas[i].original_filename)) {
                                                 documentsUsed.push(metadatas[i].original_filename);
                                             }
                                         }
                                     }
+
                                 } else {
                                     relevantContext = "No se encontraron documentos relevantes en la base de conocimiento.";
                                 }
@@ -416,12 +665,12 @@ router.post('/chat/message', verifyToken, async (req, res) => {
 
                             // 2. Obtener el prompt personalizado de la base de datos
                             const promptQuery = 'SELECT prompt FROM chat_prompt ORDER BY modification_date DESC LIMIT 1';
-                            
+
                             mysqlConnection.query(promptQuery, [], async (err, promptResults) => {
                                 if (err) {
                                     console.error('Error getting chat prompt:', err);
                                 }
-                                
+
                                 let baseSystemInstruction = promptResults && promptResults.length > 0 && promptResults[0].prompt
                                     ? promptResults[0].prompt
                                     : "Eres un asistente especializado en migración global. Proporciona información precisa y actualizada sobre temas relacionados con migración, políticas migratorias, estadísticas demográficas y tendencias globales.";
@@ -431,9 +680,10 @@ router.post('/chat/message', verifyToken, async (req, res) => {
 
 INSTRUCCIONES IMPORTANTES:
 - Debes responder ÚNICAMENTE basándote en la información proporcionada en el CONTEXTO DE DOCUMENTOS que aparece a continuación.
+- Los encabezados como "--- Fragmento X (nombre_archivo.pdf) ---" son solo para tu referencia. NO los incluyas en tu respuesta.
 - Si la pregunta no puede ser respondida con la información del contexto, indica claramente que no tienes esa información en tus documentos.
 - NO inventes información que no esté en el contexto.
-- Siempre cita o menciona las fuentes cuando sea relevante.
+- Cita el nombre del archivo (por ejemplo, "según el documento 'nombre_archivo.pdf'...") solo si es necesario para dar claridad a la respuesta. No cites los números de fragmento.
 - Si no hay documentos relevantes disponibles, informa al usuario que no tienes información suficiente en la base de conocimiento.
 
 CONTEXTO DE DOCUMENTOS:
@@ -441,7 +691,7 @@ ${relevantContext}
 
 Pregunta del usuario: ${message}
 
-Responde basándote únicamente en el contexto proporcionado arriba.`;
+Responde de forma natural y fluida, basándote únicamente en el contexto proporcionado arriba.`;
 
                                 // 4. Construir historial de conversación para mantener contexto
                                 let conversationHistory = [];
@@ -452,17 +702,38 @@ Responde basándote únicamente en el contexto proporcionado arriba.`;
                                     });
                                 });
 
+                                // Construir el contenido completo incluyendo historial
+                                let fullContent = '';
+
+                                // Agregar historial de conversación si existe
+                                if (conversationHistory.length > 0) {
+                                    fullContent += "HISTORIAL DE CONVERSACIÓN:\n";
+                                    conversationHistory.forEach(msg => {
+                                        const role = msg.role === 'user' ? 'Usuario' : 'Asistente';
+                                        fullContent += `${role}: ${msg.parts[0].text}\n`;
+                                    });
+                                    fullContent += "\n";
+                                }
+
+                                fullContent += `Nueva pregunta del usuario: ${message}`;
+
                                 try {
                                     // 5. Llamar a Gemini con RAG
-                                    const chat = ai.getGenerativeModel({ 
+                                    const model = genAI.getGenerativeModel({
                                         model: "gemini-2.5-flash",
-                                        systemInstruction: systemInstructionWithRAG
-                                    }).startChat({
-                                        history: conversationHistory
+                                        systemInstruction: systemInstructionWithRAG,
+                                        generationConfig: {
+                                            temperature: 1,
+                                            maxOutputTokens: 2000,
+                                            thinkingConfig: {
+                                                thinkingBudget: 0, // Disables thinking
+                                            },
+                                        }
                                     });
-                                    
-                                    const result = await chat.sendMessage(message);
-                                    const aiResponse = result.response.text();
+
+                                    const result = await model.generateContent(fullContent);
+                                    const response = await result.response;
+                                    const aiResponse = response.text();
 
                                     // 6. Guardar respuesta de la IA
                                     const aiMessageQuery = 'INSERT INTO chat_messages (session_id, role, content) VALUES (?, ?, ?)';
@@ -524,7 +795,7 @@ Responde basándote únicamente en el contexto proporcionado arriba.`;
                             });
                         }
                     });
-                    
+
                 } catch (innerError) {
                     console.error('Error in inner try block:', innerError);
                     res.status(500).json({
@@ -700,7 +971,7 @@ router.post('/chat/prompt', verifyToken, (req, res) => {
         if (checkResults.length > 0) {
             // Actualizar el prompt existente
             const updateQuery = 'UPDATE chat_prompt SET prompt = ?, modification_date = CURRENT_TIMESTAMP WHERE id = ?';
-            
+
             mysqlConnection.query(updateQuery, [prompt.trim(), checkResults[0].id], (err, updateResult) => {
                 if (err) {
                     console.error('Error updating chat prompt:', err);
@@ -719,7 +990,7 @@ router.post('/chat/prompt', verifyToken, (req, res) => {
         } else {
             // Crear nuevo prompt
             const insertQuery = 'INSERT INTO chat_prompt (prompt) VALUES (?)';
-            
+
             mysqlConnection.query(insertQuery, [prompt.trim()], (err, insertResult) => {
                 if (err) {
                     console.error('Error creating chat prompt:', err);
@@ -772,13 +1043,13 @@ router.post('/chat/documents', verifyToken, (req, res) => {
         try {
             const userId = cabecera.id;
             const file = req.file;
-            
+
             // Calcular hash del archivo
             const fileHash = calculateFileHash(file.buffer);
-            
+
             // Verificar si ya existe un archivo con el mismo hash
             const checkQuery = 'SELECT id, original_filename FROM chat_pdf_documents WHERE file_hash = ?';
-            
+
             mysqlConnection.query(checkQuery, [fileHash], async (err, existingFiles) => {
                 if (err) {
                     console.error('Error checking for duplicate files:', err);
@@ -799,7 +1070,7 @@ router.post('/chat/documents', verifyToken, (req, res) => {
                 try {
                     // Generar nombre único para S3
                     const s3Key = generatePdfFileName();
-                    
+
                     // Subir archivo a S3
                     const uploadParams = {
                         Bucket: bucketName,
@@ -831,7 +1102,7 @@ router.post('/chat/documents', verifyToken, (req, res) => {
                     ], async (err, result) => {
                         if (err) {
                             console.error('Error saving PDF to database:', err);
-                            
+
                             // Si falla la BD, intentar eliminar el archivo de S3
                             const deleteCommand = new DeleteObjectCommand({
                                 Bucket: bucketName,
@@ -849,21 +1120,21 @@ router.post('/chat/documents', verifyToken, (req, res) => {
 
                         const documentId = result.insertId;
 
-                        // Intentar indexar el documento en ChromaDB
+                        // Intentar indexar el documento en la base de datos vectorial
                         try {
                             // Actualizar estado a INDEXING
                             mysqlConnection.query(
-                                'UPDATE chat_pdf_documents SET status = ? WHERE id = ?', 
-                                ['INDEXING', documentId], 
-                                () => {}
+                                'UPDATE chat_pdf_documents SET status = ? WHERE id = ?',
+                                ['INDEXING', documentId],
+                                () => { }
                             );
 
                             const chunksCreated = await indexPdfDocument(s3Key, file.originalname, documentId);
-                            
+
                             // Actualizar estado a INDEXED
                             mysqlConnection.query(
-                                'UPDATE chat_pdf_documents SET status = ?, indexed_at = CURRENT_TIMESTAMP WHERE id = ?', 
-                                ['INDEXED', documentId], 
+                                'UPDATE chat_pdf_documents SET status = ?, indexed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                ['INDEXED', documentId],
                                 (updateErr) => {
                                     if (updateErr) {
                                         console.error('Error updating document status to INDEXED:', updateErr);
@@ -888,12 +1159,12 @@ router.post('/chat/documents', verifyToken, (req, res) => {
 
                         } catch (indexError) {
                             console.error('Error indexing document:', indexError);
-                            
+
                             // Actualizar estado a ERROR
                             mysqlConnection.query(
-                                'UPDATE chat_pdf_documents SET status = ? WHERE id = ?', 
-                                ['ERROR', documentId], 
-                                () => {}
+                                'UPDATE chat_pdf_documents SET status = ? WHERE id = ?',
+                                ['ERROR', documentId],
+                                () => { }
                             );
 
                             // El archivo ya está en S3 y en la BD, pero falló la indexación
@@ -985,7 +1256,7 @@ router.get('/chat/documents/:id/url', verifyToken, async (req, res) => {
     try {
         // Buscar el documento en la base de datos
         const query = 'SELECT s3_key, original_filename FROM chat_pdf_documents WHERE id = ?';
-        
+
         mysqlConnection.query(query, [id], async (err, results) => {
             if (err) {
                 console.error('Error getting PDF document:', err);
@@ -1051,7 +1322,7 @@ router.delete('/chat/documents/:id', verifyToken, async (req, res) => {
     try {
         // Primero obtener la información del documento para eliminar de S3
         const selectQuery = 'SELECT s3_key, original_filename FROM chat_pdf_documents WHERE id = ?';
-        
+
         mysqlConnection.query(selectQuery, [id], async (err, results) => {
             if (err) {
                 console.error('Error finding PDF document:', err);
@@ -1079,17 +1350,16 @@ router.delete('/chat/documents/:id', verifyToken, async (req, res) => {
 
                 await s3.send(deleteCommand);
 
-                // Eliminar de ChromaDB
+                // Eliminar de la base de datos vectorial
                 try {
                     const deletedChunks = await removeDocumentFromIndex(document.s3_key);
-                    console.log(`Eliminados ${deletedChunks} fragmentos de ChromaDB para ${document.original_filename}`);
-                } catch (chromaError) {
-                    console.error('Error eliminando de ChromaDB (continuando con BD):', chromaError);
+                } catch (vectorError) {
+                    console.error('Error eliminando de la base de datos vectorial (continuando con BD):', vectorError);
                 }
 
                 // Eliminar registro de la base de datos
                 const deleteQuery = 'DELETE FROM chat_pdf_documents WHERE id = ?';
-                
+
                 mysqlConnection.query(deleteQuery, [id], (err, deleteResult) => {
                     if (err) {
                         console.error('Error deleting PDF document from database:', err);
@@ -1108,18 +1378,18 @@ router.delete('/chat/documents/:id', verifyToken, async (req, res) => {
 
                     res.json({
                         success: true,
-                        message: `Documento "${document.original_filename}" eliminado exitosamente de S3, ChromaDB y base de datos`
+                        message: `Documento "${document.original_filename}" eliminado exitosamente de S3, base de datos vectorial y base de datos`
                     });
                 });
 
             } catch (s3Error) {
                 console.error('Error deleting from S3:', s3Error);
-                
-                // Incluso si falla S3, intentar eliminar de ChromaDB y BD
+
+                // Incluso si falla S3, intentar eliminar de la base de datos vectorial y BD
                 try {
                     await removeDocumentFromIndex(document.s3_key);
-                } catch (chromaError) {
-                    console.error('Error eliminando de ChromaDB después de fallo S3:', chromaError);
+                } catch (vectorError) {
+                    console.error('Error eliminando de la base de datos vectorial después de fallo S3:', vectorError);
                 }
 
                 const deleteQuery = 'DELETE FROM chat_pdf_documents WHERE id = ?';
@@ -1134,7 +1404,7 @@ router.delete('/chat/documents/:id', verifyToken, async (req, res) => {
 
                     res.json({
                         success: true,
-                        message: `Documento "${document.original_filename}" eliminado de la base de datos y ChromaDB (advertencia: posible archivo huérfano en S3)`,
+                        message: `Documento "${document.original_filename}" eliminado de la base de datos y base de datos vectorial (advertencia: posible archivo huérfano en S3)`,
                         warning: 'El archivo podría seguir existiendo en S3'
                     });
                 });
@@ -1193,18 +1463,18 @@ router.post('/chat/documents/reindex', verifyToken, async (req, res) => {
                 try {
                     // Actualizar estado a INDEXING
                     mysqlConnection.query(
-                        'UPDATE chat_pdf_documents SET status = ? WHERE id = ?', 
-                        ['INDEXING', doc.id], 
-                        () => {}
+                        'UPDATE chat_pdf_documents SET status = ? WHERE id = ?',
+                        ['INDEXING', doc.id],
+                        () => { }
                     );
 
                     const chunksCreated = await indexPdfDocument(doc.s3_key, doc.original_filename, doc.id);
-                    
+
                     // Actualizar estado a INDEXED
                     mysqlConnection.query(
-                        'UPDATE chat_pdf_documents SET status = ?, indexed_at = CURRENT_TIMESTAMP WHERE id = ?', 
-                        ['INDEXED', doc.id], 
-                        () => {}
+                        'UPDATE chat_pdf_documents SET status = ?, indexed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                        ['INDEXED', doc.id],
+                        () => { }
                     );
 
                     successCount++;
@@ -1215,16 +1485,14 @@ router.post('/chat/documents/reindex', verifyToken, async (req, res) => {
                         chunksCreated: chunksCreated
                     });
 
-                    console.log(`✅ Documento ${doc.original_filename} re-indexado exitosamente`);
-
                 } catch (indexError) {
                     console.error(`❌ Error re-indexando ${doc.original_filename}:`, indexError);
-                    
+
                     // Actualizar estado a ERROR
                     mysqlConnection.query(
-                        'UPDATE chat_pdf_documents SET status = ? WHERE id = ?', 
-                        ['ERROR', doc.id], 
-                        () => {}
+                        'UPDATE chat_pdf_documents SET status = ? WHERE id = ?',
+                        ['ERROR', doc.id],
+                        () => { }
                     );
 
                     errorCount++;
