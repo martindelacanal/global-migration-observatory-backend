@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { mysqlConnection, logger } = require('../utils/sharedHelpers');
+const { mysqlConnection, logger, verifyToken } = require('../utils/sharedHelpers');
 
 // Newsletter subscription endpoint
 router.post('/newsletter/subscribe', async (req, res) => {
@@ -73,6 +73,70 @@ router.post('/newsletter/subscribe', async (req, res) => {
     res.status(500).json({
       message: 'Internal server error',
       subscribed: false
+    });
+  }
+});
+
+// Admin: Get paginated newsletter subscriptions
+router.get('/newsletter/subscriptions', verifyToken, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+
+    // Validate pagination parameters
+    if (page < 1 || limit < 1 || limit > 100) {
+      return res.status(400).json({
+        message: 'Invalid pagination parameters. Page must be >= 1, limit must be between 1 and 100',
+        subscriptions: [],
+        total: 0
+      });
+    }
+
+    // Get total count of subscriptions
+    const [countRows] = await mysqlConnection.promise().query(
+      'SELECT COUNT(*) as total FROM newsletter_subscription'
+    );
+    const total = countRows[0].total;
+
+    // Get paginated subscriptions
+    const [subscriptionRows] = await mysqlConnection.promise().query(
+      `SELECT 
+        id,
+        email,
+        enabled,
+        creation_date,
+        modification_date
+      FROM newsletter_subscription 
+      ORDER BY creation_date DESC 
+      LIMIT ? OFFSET ?`,
+      [limit, offset]
+    );
+
+    // Format response according to interface
+    const subscriptions = subscriptionRows.map(row => ({
+      id: row.id,
+      email: row.email,
+      enabled: row.enabled,
+      creation_date: row.creation_date,
+      modification_date: row.modification_date
+    }));
+
+    logger.info(`Admin retrieved newsletter subscriptions: page ${page}, limit ${limit}, total ${total}`);
+    
+    res.status(200).json({
+      subscriptions,
+      total
+    });
+
+  } catch (error) {
+    console.error('Error getting newsletter subscriptions:', error);
+    logger.error('Error getting newsletter subscriptions:', error);
+    
+    res.status(500).json({
+      message: 'Internal server error',
+      subscriptions: [],
+      total: 0
     });
   }
 });
