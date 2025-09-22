@@ -122,8 +122,6 @@ router.get('/newsletter/subscriptions', verifyToken, async (req, res) => {
       modification_date: row.modification_date
     }));
 
-    logger.info(`Admin retrieved newsletter subscriptions: page ${page}, limit ${limit}, total ${total}`);
-    
     res.status(200).json({
       subscriptions,
       total
