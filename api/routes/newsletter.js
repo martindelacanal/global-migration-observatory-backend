@@ -139,4 +139,109 @@ router.get('/newsletter/subscriptions', verifyToken, async (req, res) => {
   }
 });
 
+// Admin: Update subscription status (enable/disable)
+router.put('/newsletter/subscriptions/:id/status', verifyToken, async (req, res) => {
+  try {
+    const subscriptionId = parseInt(req.params.id);
+    const { enabled } = req.body;
+
+    // Validate subscription ID
+    if (isNaN(subscriptionId) || subscriptionId <= 0) {
+      return res.status(400).json({
+        message: 'Invalid subscription ID'
+      });
+    }
+
+    // Validate enabled field
+    if (!enabled || (enabled !== 'Y' && enabled !== 'N')) {
+      return res.status(400).json({
+        message: 'Enabled field must be "Y" or "N"'
+      });
+    }
+
+    // Check if subscription exists
+    const [existingRows] = await mysqlConnection.promise().query(
+      'SELECT id, email FROM newsletter_subscription WHERE id = ?',
+      [subscriptionId]
+    );
+
+    if (existingRows.length === 0) {
+      return res.status(404).json({
+        message: 'Subscription not found'
+      });
+    }
+
+    // Update subscription status
+    await mysqlConnection.promise().query(
+      'UPDATE newsletter_subscription SET enabled = ?, modification_date = CURRENT_TIMESTAMP WHERE id = ?',
+      [enabled, subscriptionId]
+    );
+
+    const action = enabled === 'Y' ? 'enabled' : 'disabled';
+    const email = existingRows[0].email;
+    
+    logger.info(`Newsletter subscription ${action} for email: ${email} (ID: ${subscriptionId})`);
+    
+    res.status(200).json({
+      message: `Subscription successfully ${action}`
+    });
+
+  } catch (error) {
+    console.error('Error updating subscription status:', error);
+    logger.error('Error updating subscription status:', error);
+    
+    res.status(500).json({
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Admin: Delete a subscription
+router.delete('/newsletter/subscriptions/:id', verifyToken, async (req, res) => {
+  try {
+    const subscriptionId = parseInt(req.params.id);
+
+    // Validate subscription ID
+    if (isNaN(subscriptionId) || subscriptionId <= 0) {
+      return res.status(400).json({
+        message: 'Invalid subscription ID'
+      });
+    }
+
+    // Check if subscription exists
+    const [existingRows] = await mysqlConnection.promise().query(
+      'SELECT id, email FROM newsletter_subscription WHERE id = ?',
+      [subscriptionId]
+    );
+
+    if (existingRows.length === 0) {
+      return res.status(404).json({
+        message: 'Subscription not found'
+      });
+    }
+
+    // Delete subscription
+    await mysqlConnection.promise().query(
+      'DELETE FROM newsletter_subscription WHERE id = ?',
+      [subscriptionId]
+    );
+
+    const email = existingRows[0].email;
+    
+    logger.info(`Newsletter subscription deleted for email: ${email} (ID: ${subscriptionId})`);
+    
+    res.status(200).json({
+      message: 'Subscription successfully deleted'
+    });
+
+  } catch (error) {
+    console.error('Error deleting subscription:', error);
+    logger.error('Error deleting subscription:', error);
+    
+    res.status(500).json({
+      message: 'Internal server error'
+    });
+  }
+});
+
 module.exports = router;
