@@ -269,21 +269,27 @@ async function replaceS3KeysWithSignedUrls(content) {
   }
 }
 
+const MIN_ARTICLE_PRIORITY = 1;
+const MAX_ARTICLE_PRIORITY = 8;
+
 // Helper function to manage article priorities (1-8, unique values)
 async function managePriority(newPriority, excludeArticleId = null) {
-  try {
-    // If no priority is set, return null
-    if (!newPriority || newPriority < 1 || newPriority > 8) {
-      return null;
-    }
+  const priority = Number.parseInt(newPriority, 10);
 
-    const priority = parseInt(newPriority);
+  if (!Number.isInteger(priority) || priority < MIN_ARTICLE_PRIORITY || priority > MAX_ARTICLE_PRIORITY) {
+    return null;
+  }
+
+  const connection = await mysqlConnection.promise().getConnection();
+
+  try {
+    await connection.beginTransaction();
 
     // Get the current priority of the article being updated (if any)
     let currentPriority = null;
     if (excludeArticleId) {
-      const [currentArticle] = await mysqlConnection.promise().query(
-        'SELECT priority FROM article WHERE id = ?',
+      const [currentArticle] = await connection.query(
+        'SELECT priority FROM article WHERE id = ? FOR UPDATE',
         [excludeArticleId]
       );
       if (currentArticle.length > 0) {
@@ -291,75 +297,72 @@ async function managePriority(newPriority, excludeArticleId = null) {
       }
     }
 
-    // Check if the priority already exists (excluding the current article being updated)
+    // Nothing to do if an existing article keeps the same priority
+    if (currentPriority === priority) {
+      await connection.commit();
+      return priority;
+    }
+
+    // Check if the target priority is already used by another article
     let existingQuery = 'SELECT id FROM article WHERE priority = ?';
-    let existingParams = [priority];
-    
+    const existingParams = [priority];
+
     if (excludeArticleId) {
       existingQuery += ' AND id != ?';
       existingParams.push(excludeArticleId);
     }
 
-    const [existingArticle] = await mysqlConnection.promise().query(existingQuery, existingParams);
+    existingQuery += ' FOR UPDATE';
+    const [existingArticle] = await connection.query(existingQuery, existingParams);
 
-    // If priority doesn't exist, we can use it directly
-    if (existingArticle.length === 0) {
-      return priority;
-    }
-
-    // Start a transaction for atomic priority updates
-    const connection = await mysqlConnection.promise().getConnection();
-    await connection.beginTransaction();
-
-    try {
+    if (existingArticle.length > 0) {
       // Case 1: Creating new article or article without previous priority
       if (!excludeArticleId || currentPriority === null) {
-        
-        // Get all articles with priority >= newPriority and shift them down
-        const [articlesToShift] = await connection.query(
-          'SELECT id, priority FROM article WHERE priority >= ? AND priority IS NOT NULL ORDER BY priority DESC',
-          [priority]
-        );
-        
-        for (const article of articlesToShift) {
-          await connection.query(
-            'UPDATE article SET priority = ? WHERE id = ?',
-            [article.priority + 1, article.id]
-          );
+        const shiftParams = [MAX_ARTICLE_PRIORITY, priority];
+        let shiftQuery = `
+          UPDATE article
+          SET priority = CASE
+            WHEN priority = ? THEN NULL
+            ELSE priority + 1
+          END
+          WHERE priority >= ? AND priority IS NOT NULL
+        `;
+
+        if (excludeArticleId) {
+          shiftQuery += ' AND id != ?';
+          shiftParams.push(excludeArticleId);
         }
+
+        await connection.query(shiftQuery, shiftParams);
       }
       // Case 2: Article is moving from one priority to another
-      else {
-        
-        if (currentPriority < priority) {
-          // Moving down: shift articles between currentPriority+1 and newPriority up
-          await connection.query(
-            'UPDATE article SET priority = priority - 1 WHERE priority > ? AND priority <= ? AND id != ?',
-            [currentPriority, priority, excludeArticleId]
-          );
-        } else if (currentPriority > priority) {
-          // Moving up: shift articles between newPriority and currentPriority-1 down
-          await connection.query(
-            'UPDATE article SET priority = priority + 1 WHERE priority >= ? AND priority < ? AND id != ?',
-            [priority, currentPriority, excludeArticleId]
-          );
-        }
-        // If currentPriority === priority, no shifts needed (shouldn't happen due to earlier check)
+      else if (currentPriority < priority) {
+        // Moving down: shift articles between currentPriority+1 and newPriority up
+        await connection.query(
+          'UPDATE article SET priority = priority - 1 WHERE priority > ? AND priority <= ? AND id != ?',
+          [currentPriority, priority, excludeArticleId]
+        );
+      } else if (currentPriority > priority) {
+        // Moving up: shift articles between newPriority and currentPriority-1 down
+        await connection.query(
+          'UPDATE article SET priority = priority + 1 WHERE priority >= ? AND priority < ? AND id != ?',
+          [priority, currentPriority, excludeArticleId]
+        );
       }
-
-      await connection.commit();
-      connection.release();
-      return priority;
-
-    } catch (shiftError) {
-      await connection.rollback();
-      connection.release();
-      throw shiftError;
     }
 
+    await connection.commit();
+    return priority;
   } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      logger.error('Error rolling back priority transaction:', rollbackError);
+    }
     logger.error('Error managing article priority:', error);
     throw error;
+  } finally {
+    connection.release();
   }
 }
 

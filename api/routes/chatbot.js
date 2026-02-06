@@ -57,62 +57,230 @@ if (!fs.existsSync(VECTOR_DB_PATH)) {
 // Inicializar Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+function getEnvInt(name, defaultValue, minValue, maxValue) {
+    const parsedValue = Number.parseInt(process.env[name], 10);
+
+    if (!Number.isInteger(parsedValue)) {
+        return defaultValue;
+    }
+
+    return Math.min(maxValue, Math.max(minValue, parsedValue));
+}
+
+const CHAT_MODEL_NAME = process.env.GEMINI_CHAT_MODEL || 'gemini-3-flash-preview';
+const EMBEDDING_MODEL_NAME = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
+const EMBEDDING_BATCH_SIZE = getEnvInt('GEMINI_EMBEDDING_BATCH_SIZE', 20, 1, 100);
+const EMBEDDING_MAX_RETRIES = getEnvInt('GEMINI_EMBEDDING_MAX_RETRIES', 1, 0, 10);
+const EMBEDDING_RETRY_BASE_MS = getEnvInt('GEMINI_EMBEDDING_RETRY_BASE_MS', 1200, 250, 60000);
+const EMBEDDING_RETRY_MAX_MS = getEnvInt('GEMINI_EMBEDDING_RETRY_MAX_MS', 30000, EMBEDDING_RETRY_BASE_MS, 120000);
+const EMBEDDING_INTER_BATCH_DELAY_MS = getEnvInt('GEMINI_EMBEDDING_INTER_BATCH_DELAY_MS', 150, 0, 10000);
+const EMBEDDING_FALLBACK_COOLDOWN_MS = getEnvInt('EMBEDDING_FALLBACK_COOLDOWN_MS', 60000, 1000, 300000);
+const LOCAL_EMBEDDING_DIMENSION = getEnvInt('LOCAL_EMBEDDING_DIMENSION', 768, 128, 3072);
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parseRetryDelayMs(delayValue) {
+    if (typeof delayValue !== 'string') {
+        return null;
+    }
+
+    const match = delayValue.trim().match(/^(\d+(?:\.\d+)?)s$/);
+    if (!match) {
+        return null;
+    }
+
+    return Math.ceil(Number.parseFloat(match[1]) * 1000);
+}
+
+function getRetryDelayMsFromError(error) {
+    if (!error || typeof error !== 'object') {
+        return null;
+    }
+
+    if (typeof error.retryDelay === 'string') {
+        const parsedDelay = parseRetryDelayMs(error.retryDelay);
+        if (parsedDelay !== null) {
+            return parsedDelay;
+        }
+    }
+
+    if (!Array.isArray(error.errorDetails)) {
+        return null;
+    }
+
+    for (const detail of error.errorDetails) {
+        if (!detail || typeof detail !== 'object') {
+            continue;
+        }
+
+        const detailType = String(detail['@type'] || '');
+        if (!detailType.includes('RetryInfo') || typeof detail.retryDelay !== 'string') {
+            continue;
+        }
+
+        const parsedDelay = parseRetryDelayMs(detail.retryDelay);
+        if (parsedDelay !== null) {
+            return parsedDelay;
+        }
+    }
+
+    return null;
+}
+
+function isRetryableEmbeddingError(error) {
+    const statusCode = Number(error?.status);
+    if ([429, 500, 502, 503, 504].includes(statusCode)) {
+        return true;
+    }
+
+    const message = String(error?.message || '').toLowerCase();
+    return (
+        message.includes('too many requests') ||
+        message.includes('rate limit') ||
+        message.includes('quota') ||
+        message.includes('resource_exhausted') ||
+        message.includes('temporarily unavailable') ||
+        message.includes('timeout')
+    );
+}
+
+function getRetryDelayMs(error, attempt) {
+    const serverDelayMs = getRetryDelayMsFromError(error);
+    if (Number.isInteger(serverDelayMs) && serverDelayMs > 0) {
+        return Math.min(EMBEDDING_RETRY_MAX_MS, Math.max(EMBEDDING_RETRY_BASE_MS, serverDelayMs));
+    }
+
+    const exponentialDelay = EMBEDDING_RETRY_BASE_MS * Math.pow(2, attempt);
+    const jitter = Math.floor(Math.random() * 200);
+    return Math.min(EMBEDDING_RETRY_MAX_MS, exponentialDelay + jitter);
+}
+
+function unwrapError(error) {
+    if (error && typeof error === 'object' && error.cause) {
+        return error.cause;
+    }
+    return error;
+}
+
+function shouldFallbackToLocalEmbeddings(error) {
+    return isRetryableEmbeddingError(unwrapError(error));
+}
+
+function getFallbackCooldownMs(error) {
+    const rootError = unwrapError(error);
+    const retryDelayMs = getRetryDelayMsFromError(rootError);
+    if (Number.isInteger(retryDelayMs) && retryDelayMs > 0) {
+        return retryDelayMs;
+    }
+    return EMBEDDING_FALLBACK_COOLDOWN_MS;
+}
+
 // Función de embedding usando Gemini
 class GeminiEmbeddingFunction {
     constructor() {
-        // El modelo 'embedding-001' es el estándar para esta tarea.
-        this.model = genAI.getGenerativeModel({ model: "embedding-001" });
-        this.batchSize = 100; // Límite de la API de Gemini es 100
+        this.modelName = EMBEDDING_MODEL_NAME;
+        this.model = genAI.getGenerativeModel({ model: this.modelName });
+        this.batchSize = EMBEDDING_BATCH_SIZE;
+        this.maxRetries = EMBEDDING_MAX_RETRIES;
+        this.interBatchDelayMs = EMBEDDING_INTER_BATCH_DELAY_MS;
     }
 
-    async embed(texts) {
-        try {
-            const allEmbeddings = [];
-            // Procesar los textos en lotes para no exceder el límite de la API
-            for (let i = 0; i < texts.length; i += this.batchSize) {
-                const batchTexts = texts.slice(i, i + this.batchSize);
+    async embedBatch(batchTexts) {
+        let lastError = null;
 
+        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+            try {
                 const result = await this.model.batchEmbedContents({
                     requests: batchTexts.map(text => ({
                         content: { parts: [{ text }] },
                     })),
                 });
 
-                const batchEmbeddings = result.embeddings.map(e => e.values);
-                allEmbeddings.push(...batchEmbeddings);
-            }
-            return allEmbeddings;
-        } catch (error) {
-            console.error('Error generating embeddings with Gemini:', error);
-            // Lanza el error para que el proceso que lo llamó pueda manejarlo.
-            throw new Error('Failed to generate embeddings.');
-        }
-    }
-}
+                if (!result || !Array.isArray(result.embeddings)) {
+                    throw new Error(`Invalid embedding response from model "${this.modelName}".`);
+                }
 
-// Función de embedding simple usando hash para evitar dependencias externas
-class SimpleEmbeddingFunction {
-    constructor() {
-        this.dimension = 384; // Dimensión estándar para embeddings
+                return result.embeddings.map(embedding => embedding.values);
+            } catch (error) {
+                lastError = error;
+                const canRetry = isRetryableEmbeddingError(error) && attempt < this.maxRetries;
+
+                if (!canRetry) {
+                    break;
+                }
+
+                const delayMs = getRetryDelayMs(error, attempt);
+                console.warn(`[Embeddings] Retry ${attempt + 1}/${this.maxRetries} in ${delayMs}ms (model: ${this.modelName}).`);
+                await sleep(delayMs);
+            }
+        }
+
+        const wrappedError = new Error(`Failed to generate embeddings with Gemini model "${this.modelName}".`);
+        wrappedError.status = lastError?.status;
+        wrappedError.errorDetails = lastError?.errorDetails;
+        wrappedError.cause = lastError;
+        throw wrappedError;
     }
 
     async embed(texts) {
-        // Crear embeddings simples basados en características del texto
-        return texts.map(text => {
-            const normalized = text.toLowerCase().replace(/[^\w\s]/g, '');
-            const words = normalized.split(/\s+/).filter(w => w.length > 0);
+        if (!Array.isArray(texts) || texts.length === 0) {
+            return [];
+        }
 
-            // Crear un vector de características basado en el texto
+        const allEmbeddings = [];
+
+        // Process texts in batches to respect API limits and smooth request bursts.
+        for (let i = 0; i < texts.length; i += this.batchSize) {
+            const batchTexts = texts.slice(i, i + this.batchSize);
+            const batchEmbeddings = await this.embedBatch(batchTexts);
+            allEmbeddings.push(...batchEmbeddings);
+
+            const hasMoreBatches = i + this.batchSize < texts.length;
+            if (hasMoreBatches && this.interBatchDelayMs > 0) {
+                await sleep(this.interBatchDelayMs);
+            }
+        }
+
+        return allEmbeddings;
+    }
+}
+
+class SimpleEmbeddingFunction {
+    constructor() {
+        this.dimension = LOCAL_EMBEDDING_DIMENSION;
+    }
+
+    async embed(texts) {
+        return texts.map(text => {
+            const normalized = String(text || '').toLowerCase().replace(/[^\w\s]/g, ' ');
+            const words = normalized.split(/\s+/).filter(word => word.length > 1);
             const embedding = new Array(this.dimension).fill(0);
 
-            // Llenar el embedding con características del texto
-            for (let i = 0; i < words.length && i < this.dimension; i++) {
-                const word = words[i];
-                const hash = this.simpleHash(word);
-                embedding[i % this.dimension] += hash / (words.length + 1);
+            if (words.length === 0) {
+                return embedding;
             }
 
-            // Normalizar el vector
+            const frequencies = new Map();
+            for (const word of words) {
+                frequencies.set(word, (frequencies.get(word) || 0) + 1);
+            }
+
+            for (const [word, count] of frequencies.entries()) {
+                const weight = 1 + Math.log(count);
+                const primaryHash = this.simpleHash(word, 0x9e3779b9);
+                const secondaryHash = this.simpleHash(word, 0x85ebca6b);
+
+                const primaryIndex = primaryHash % this.dimension;
+                const secondaryIndex = secondaryHash % this.dimension;
+                const primarySign = (primaryHash & 1) === 0 ? 1 : -1;
+                const secondarySign = (secondaryHash & 1) === 0 ? 1 : -1;
+
+                embedding[primaryIndex] += weight * primarySign;
+                embedding[secondaryIndex] += (weight * 0.5) * secondarySign;
+            }
+
             const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
             if (magnitude > 0) {
                 for (let i = 0; i < embedding.length; i++) {
@@ -124,21 +292,47 @@ class SimpleEmbeddingFunction {
         });
     }
 
-    simpleHash(str) {
-        let hash = 0;
+    simpleHash(str, seed = 0) {
+        let hash = (2166136261 ^ seed) >>> 0;
         for (let i = 0; i < str.length; i++) {
-            const char = str.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash; // Convert to 32-bit integer
+            hash ^= str.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+            hash >>>= 0;
         }
-        return Math.abs(hash) / 2147483647; // Normalize to 0-1
+        return hash;
     }
 }
 
+class ResilientEmbeddingFunction {
+    constructor() {
+        this.geminiEmbedding = new GeminiEmbeddingFunction();
+        this.localEmbedding = new SimpleEmbeddingFunction();
+        this.fallbackUntil = 0;
+    }
+
+    async embed(texts) {
+        if (Date.now() < this.fallbackUntil) {
+            return this.localEmbedding.embed(texts);
+        }
+
+        try {
+            return await this.geminiEmbedding.embed(texts);
+        } catch (error) {
+            if (!shouldFallbackToLocalEmbeddings(error)) {
+                throw error;
+            }
+
+            const cooldownMs = getFallbackCooldownMs(error);
+            this.fallbackUntil = Date.now() + cooldownMs;
+            console.warn(`[Embeddings] Gemini is temporarily unavailable. Using local fallback for ${Math.ceil(cooldownMs / 1000)}s.`);
+            return this.localEmbedding.embed(texts);
+        }
+    }
+}
 // Clase para manejar la base de datos vectorial simple
 class SimpleVectorDB {
     constructor() {
-        this.embeddingFunction = new GeminiEmbeddingFunction();
+        this.embeddingFunction = new ResilientEmbeddingFunction();
         this.collectionPath = path.join(VECTOR_DB_PATH, `${COLLECTION_NAME}.json`);
         this.collection = this.loadCollection();
     }
@@ -171,8 +365,16 @@ class SimpleVectorDB {
     async add({ ids, documents, metadatas }) {
         try {
             const embeddings = await this.embeddingFunction.embed(documents);
+            if (!Array.isArray(embeddings) || embeddings.length !== ids.length) {
+                throw new Error('Embedding count does not match document count.');
+            }
 
             for (let i = 0; i < ids.length; i++) {
+                const embeddingVector = embeddings[i];
+                if (!Array.isArray(embeddingVector) || embeddingVector.length === 0) {
+                    continue;
+                }
+
                 // Verificar si el documento ya existe
                 const existingIndex = this.collection.documents.findIndex(doc => doc.id === ids[i]);
 
@@ -180,7 +382,7 @@ class SimpleVectorDB {
                     id: ids[i],
                     document: documents[i],
                     metadata: metadatas[i],
-                    embedding: embeddings[i],
+                    embedding: embeddingVector,
                     created_at: new Date().toISOString()
                 };
 
@@ -211,17 +413,35 @@ class SimpleVectorDB {
             }
 
             const queryEmbeddings = await this.embeddingFunction.embed(queryTexts);
+            if (!Array.isArray(queryEmbeddings) || queryEmbeddings.length === 0 || !Array.isArray(queryEmbeddings[0])) {
+                return {
+                    documents: [[]],
+                    metadatas: [[]],
+                    distances: [[]]
+                };
+            }
+
             const queryEmbedding = queryEmbeddings[0];
 
             // Calcular similitudes coseno
-            const similarities = this.collection.documents.map(doc => {
-                const similarity = this.cosineSimilarity(queryEmbedding, doc.embedding);
+            const similarities = this.collection.documents
+                .filter(doc => Array.isArray(doc.embedding) && doc.embedding.length > 0)
+                .map(doc => {
+                    const similarity = this.cosineSimilarity(queryEmbedding, doc.embedding);
+                    return {
+                        ...doc,
+                        similarity: similarity,
+                        distance: 1 - similarity // Convertir similitud a distancia
+                    };
+                });
+
+            if (similarities.length === 0) {
                 return {
-                    ...doc,
-                    similarity: similarity,
-                    distance: 1 - similarity // Convertir similitud a distancia
+                    documents: [[]],
+                    metadatas: [[]],
+                    distances: [[]]
                 };
-            });
+            }
 
             // Ordenar por similitud (mayor a menor)
             similarities.sort((a, b) => b.similarity - a.similarity);
@@ -297,11 +517,33 @@ class SimpleVectorDB {
     }
 
     cosineSimilarity(vecA, vecB) {
-        const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
-        const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
-        const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+        if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length === 0 || vecB.length === 0) {
+            return 0;
+        }
 
-        if (magnitudeA === 0 || magnitudeB === 0) return 0;
+        const dimensions = Math.min(vecA.length, vecB.length);
+        if (dimensions === 0) {
+            return 0;
+        }
+
+        let dotProduct = 0;
+        let magnitudeASquared = 0;
+        let magnitudeBSquared = 0;
+
+        for (let i = 0; i < dimensions; i++) {
+            const a = Number(vecA[i]) || 0;
+            const b = Number(vecB[i]) || 0;
+            dotProduct += a * b;
+            magnitudeASquared += a * a;
+            magnitudeBSquared += b * b;
+        }
+
+        const magnitudeA = Math.sqrt(magnitudeASquared);
+        const magnitudeB = Math.sqrt(magnitudeBSquared);
+        if (magnitudeA === 0 || magnitudeB === 0) {
+            return 0;
+        }
+
         return dotProduct / (magnitudeA * magnitudeB);
     }
 }
@@ -720,7 +962,7 @@ Responde de forma natural y fluida, basándote únicamente en el contexto propor
                                 try {
                                     // 5. Llamar a Gemini con RAG
                                     const model = genAI.getGenerativeModel({
-                                        model: "gemini-2.5-flash",
+                                        model: CHAT_MODEL_NAME,
                                         systemInstruction: systemInstructionWithRAG,
                                         generationConfig: {
                                             temperature: 1,
