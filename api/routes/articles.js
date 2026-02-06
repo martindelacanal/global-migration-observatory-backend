@@ -144,24 +144,69 @@ async function processContentImages(htmlContent, articleId, language = 'en') {
   }
 }
 
+function decodeHtmlAmpersands(value) {
+  return String(value || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&#38;/gi, '&');
+}
+
+function extractS3KeyFromUrl(urlValue) {
+  try {
+    if (!urlValue || !bucketName) return null;
+
+    const normalizedUrl = decodeHtmlAmpersands(urlValue);
+    const parsedUrl = new URL(normalizedUrl);
+    const host = parsedUrl.hostname.toLowerCase();
+    const bucket = String(bucketName).toLowerCase();
+    const path = parsedUrl.pathname || '';
+
+    if (!path || path === '/') return null;
+
+    // Virtual-hosted style:
+    // https://{bucket}.s3.{region}.amazonaws.com/{key}
+    const virtualHostPrefix = `${bucket}.s3`;
+    if (host.startsWith(virtualHostPrefix) && host.endsWith('.amazonaws.com')) {
+      const key = decodeURIComponent(path.slice(1));
+      return key || null;
+    }
+
+    // Path-style:
+    // https://s3.{region}.amazonaws.com/{bucket}/{key}
+    if (
+      (host === 's3.amazonaws.com' || (host.startsWith('s3.') && host.endsWith('.amazonaws.com'))) &&
+      path.toLowerCase().startsWith(`/${bucket}/`)
+    ) {
+      const key = decodeURIComponent(path.slice(bucket.length + 2));
+      return key || null;
+    }
+
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Helper function to convert S3 URLs back to placeholders
 function convertS3UrlsToPlaceholders(content) {
   try {
-    // Regex to match S3 URLs and extract the S3 key (hash)
-    const s3UrlRegex = /https:\/\/community-data-files\.s3\.us-west-1\.amazonaws\.com\/([a-f0-9]+)\?[^"']*/g;
-    
+    if (typeof content !== 'string' || content.length === 0) {
+      return content;
+    }
+
+    const s3UrlRegex = /https:\/\/[^"'\s<]+/gi;
     let processedContent = content;
     let match;
-    
+
     while ((match = s3UrlRegex.exec(content)) !== null) {
       const fullUrl = match[0];
-      const s3Key = match[1];
-      const placeholder = `{{S3_KEY:${s3Key}}}`;
-      
-      // Replace the full URL with the placeholder
-      processedContent = processedContent.replace(fullUrl, placeholder);
+      const s3Key = extractS3KeyFromUrl(fullUrl);
+
+      if (s3Key) {
+        const placeholder = `{{S3_KEY:${s3Key}}}`;
+        processedContent = processedContent.replace(fullUrl, placeholder);
+      }
     }
-    
+
     return processedContent;
   } catch (error) {
     logger.error('Error converting S3 URLs to placeholders:', error);
@@ -224,13 +269,20 @@ async function cleanupOrphanedContentImages(articleId, newContentEn, newContentE
 // Helper function to replace S3 key placeholders with signed URLs in content (OPTIMIZED)
 async function replaceS3KeysWithSignedUrls(content) {
   try {
+    if (typeof content !== 'string' || content.length === 0) {
+      return content;
+    }
+
+    // Refresh legacy/expired S3 URLs by converting them to placeholders first.
+    const normalizedContent = convertS3UrlsToPlaceholders(content);
+
     // Find all S3 key placeholders in the format {{S3_KEY:filename}}
     const s3KeyRegex = /\{\{S3_KEY:([^}]+)\}\}/g;
     const matches = [];
     let match;
 
     // Collect all S3 keys first
-    while ((match = s3KeyRegex.exec(content)) !== null) {
+    while ((match = s3KeyRegex.exec(normalizedContent)) !== null) {
       matches.push({
         placeholder: match[0],
         s3Key: match[1]
@@ -238,14 +290,14 @@ async function replaceS3KeysWithSignedUrls(content) {
     }
 
     if (matches.length === 0) {
-      return content;
+      return normalizedContent;
     }
 
     // Generate all signed URLs in parallel
     const s3Keys = matches.map(m => m.s3Key);
     const signedUrls = await getSignedUrlsForImages(s3Keys);
     
-    let modifiedContent = content;
+    let modifiedContent = normalizedContent;
 
     // Replace all placeholders with their corresponding signed URLs
     matches.forEach((matchData, index) => {
@@ -618,7 +670,6 @@ router.get('/article', async (req, res) => {
       LEFT JOIN category c ON a.category_id = c.id
       LEFT JOIN article_status asi ON a.article_status_id = asi.id
       LEFT JOIN article_images ai ON a.id = ai.article_id AND ai.image_type IN ('preview_en', 'preview_es')
-      WHERE a.article_status_id = 2
       GROUP BY a.id
       ORDER BY a.publication_date DESC, a.creation_date DESC
       LIMIT ? OFFSET ?
@@ -829,7 +880,7 @@ router.get('/article/:id', async (req, res) => {
       createdAt: article.creation_date,
       updatedAt: article.modification_date
     };
-
+    
     res.json(response);
 
   } catch (error) {
