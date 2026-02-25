@@ -965,7 +965,7 @@ Responde de forma natural y fluida, basándote únicamente en el contexto propor
                                         model: CHAT_MODEL_NAME,
                                         systemInstruction: systemInstructionWithRAG,
                                         generationConfig: {
-                                            temperature: 1,
+                                            temperature: 0.2,
                                             maxOutputTokens: 2000
                                         }
                                     });
