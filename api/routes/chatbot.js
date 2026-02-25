@@ -67,8 +67,8 @@ function getEnvInt(name, defaultValue, minValue, maxValue) {
     return Math.min(maxValue, Math.max(minValue, parsedValue));
 }
 
-const CHAT_MODEL_NAME = process.env.GEMINI_CHAT_MODEL || 'gemini-3-flash-preview';
-const EMBEDDING_MODEL_NAME = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
+const CHAT_MODEL_NAME = process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash';
+const EMBEDDING_MODEL_NAME = process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004';
 const EMBEDDING_BATCH_SIZE = getEnvInt('GEMINI_EMBEDDING_BATCH_SIZE', 20, 1, 100);
 const EMBEDDING_MAX_RETRIES = getEnvInt('GEMINI_EMBEDDING_MAX_RETRIES', 1, 0, 10);
 const EMBEDDING_RETRY_BASE_MS = getEnvInt('GEMINI_EMBEDDING_RETRY_BASE_MS', 1200, 250, 60000);
@@ -966,10 +966,7 @@ Responde de forma natural y fluida, basándote únicamente en el contexto propor
                                         systemInstruction: systemInstructionWithRAG,
                                         generationConfig: {
                                             temperature: 1,
-                                            maxOutputTokens: 2000,
-                                            thinkingConfig: {
-                                                thinkingBudget: 0, // Disables thinking
-                                            },
+                                            maxOutputTokens: 2000
                                         }
                                     });
 
